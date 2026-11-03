@@ -18,6 +18,34 @@ const TRANSFER_DISCRIMINATOR: u32 = 2;
 pub struct TransferCheck {
     pub expected_destination: [u8; 32],
     pub max_lamports: u64,
+    /// When set, the System transfer source must be this 32-byte key.
+    pub expected_source: Option<[u8; 32]>,
+    /// Relayer may sit at account 0 as fee payer. The vault still signs.
+    pub allow_relayer_fee_payer: bool,
+}
+
+impl TransferCheck {
+    pub fn vault_pays(expected_destination: [u8; 32], max_lamports: u64) -> Self {
+        Self {
+            expected_destination,
+            max_lamports,
+            expected_source: None,
+            allow_relayer_fee_payer: false,
+        }
+    }
+
+    pub fn relayer_pays(
+        expected_source: [u8; 32],
+        expected_destination: [u8; 32],
+        max_lamports: u64,
+    ) -> Self {
+        Self {
+            expected_destination,
+            max_lamports,
+            expected_source: Some(expected_source),
+            allow_relayer_fee_payer: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +64,9 @@ fn is_compute_budget(msg: &LegacyMessage, ix_index: usize) -> bool {
 }
 
 /// Accept a legacy message whose non-budget instructions are exactly one
-/// `SystemProgram::Transfer` from the fee payer to `expected_destination`,
-/// with `lamports <= max_lamports`.
+/// `SystemProgram::Transfer` to `expected_destination`, with
+/// `lamports <= max_lamports`. Source is the fee payer unless
+/// `allow_relayer_fee_payer` is set (relayer at index 0, vault still signs).
 pub fn validate_system_transfer(
     msg: &LegacyMessage,
     check: &TransferCheck,
@@ -79,11 +108,19 @@ pub fn validate_system_transfer(
     let from = *msg.account_keys.get(from_idx).ok_or(ShapeError::MissingAccounts)?;
     let to = *msg.account_keys.get(to_idx).ok_or(ShapeError::MissingAccounts)?;
 
-    if from_idx != 0 {
+    if from_idx != 0 && !check.allow_relayer_fee_payer {
+        return Err(ShapeError::FeePayerNotSource);
+    }
+    if from_idx != 0 && !msg.is_signer(0) {
         return Err(ShapeError::FeePayerNotSource);
     }
     if !msg.is_signer(from_idx) {
         return Err(ShapeError::SourceNotSigner);
+    }
+    if let Some(expected_source) = check.expected_source {
+        if from != expected_source {
+            return Err(ShapeError::WrongSource);
+        }
     }
     if !msg.is_writable(to_idx) {
         return Err(ShapeError::DestinationNotWritable);
@@ -151,13 +188,7 @@ mod tests {
         let from = key(1);
         let to = key(2);
         let msg = transfer_message(from, to, 50_000);
-        let got = validate_system_transfer(
-            &msg,
-            &TransferCheck {
-                expected_destination: to,
-                max_lamports: 100_000,
-            },
-        )
+        let got = validate_system_transfer(&msg, &TransferCheck::vault_pays(to, 100_000))
         .unwrap();
         assert_eq!(got.from, from);
         assert_eq!(got.to, to);
@@ -167,13 +198,7 @@ mod tests {
     #[test]
     fn rejects_attacker_destination() {
         let msg = transfer_message(key(1), key(9), 1);
-        let err = validate_system_transfer(
-            &msg,
-            &TransferCheck {
-                expected_destination: key(2),
-                max_lamports: 1_000,
-            },
-        )
+        let err = validate_system_transfer(&msg, &TransferCheck::vault_pays(key(2), 1_000))
         .unwrap_err();
         assert_eq!(err, ShapeError::WrongDestination);
     }
@@ -182,13 +207,7 @@ mod tests {
     fn rejects_amount_above_cap() {
         let to = key(2);
         let msg = transfer_message(key(1), to, 2_000);
-        let err = validate_system_transfer(
-            &msg,
-            &TransferCheck {
-                expected_destination: to,
-                max_lamports: 1_000,
-            },
-        )
+        let err = validate_system_transfer(&msg, &TransferCheck::vault_pays(to, 1_000))
         .unwrap_err();
         assert_eq!(err, ShapeError::AmountAboveCap);
     }
@@ -202,13 +221,7 @@ mod tests {
             accounts: vec![0, 1],
             data: transfer_data(1),
         });
-        let err = validate_system_transfer(
-            &msg,
-            &TransferCheck {
-                expected_destination: to,
-                max_lamports: 100,
-            },
-        )
+        let err = validate_system_transfer(&msg, &TransferCheck::vault_pays(to, 100))
         .unwrap_err();
         assert_eq!(err, ShapeError::ExtraInstruction);
     }
@@ -228,14 +241,7 @@ mod tests {
         let bytes = serialize_legacy_message(&transfer_message(key(1), to, 42));
         let before = env::used_gas();
         let msg = parse_legacy_message(&bytes).unwrap();
-        let _ = validate_system_transfer(
-            &msg,
-            &TransferCheck {
-                expected_destination: to,
-                max_lamports: 100,
-            },
-        )
-        .unwrap();
+        let _ = validate_system_transfer(&msg, &TransferCheck::vault_pays(to, 100)).unwrap();
         let used = env::used_gas().saturating_sub(before);
         // Host-side mock runtime; recorded so spikes.md can quote a number.
         env::log_str(&format!(
@@ -244,5 +250,58 @@ mod tests {
         ));
         env::log_str(&format!("parser_gas_estimate_gas={}", used.as_gas()));
         assert!(used.as_gas() > 0);
+    }
+
+    fn relayer_paid_message(
+        relayer: [u8; 32],
+        from: [u8; 32],
+        to: [u8; 32],
+        lamports: u64,
+    ) -> LegacyMessage {
+        LegacyMessage {
+            header: MessageHeader {
+                num_required_signatures: 2,
+                num_readonly_signed: 0,
+                num_readonly_unsigned: 1,
+            },
+            account_keys: vec![relayer, from, to, SYSTEM_PROGRAM],
+            recent_blockhash: key(0xff),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 3,
+                accounts: vec![1, 2],
+                data: transfer_data(lamports),
+            }],
+        }
+    }
+
+    #[test]
+    fn accepts_relayer_fee_payer() {
+        let relayer = key(8);
+        let from = key(1);
+        let to = key(2);
+        let msg = relayer_paid_message(relayer, from, to, 1_000);
+        let got = validate_system_transfer(&msg, &TransferCheck::relayer_pays(from, to, 1_000))
+            .unwrap();
+        assert_eq!(got.from, from);
+        assert_eq!(got.to, to);
+        assert_eq!(got.lamports, 1_000);
+    }
+
+    #[test]
+    fn rejects_relayer_paid_wrong_source() {
+        let msg = relayer_paid_message(key(8), key(1), key(2), 1);
+        let err = validate_system_transfer(
+            &msg,
+            &TransferCheck::relayer_pays(key(3), key(2), 10),
+        )
+        .unwrap_err();
+        assert_eq!(err, ShapeError::WrongSource);
+    }
+
+    #[test]
+    fn rejects_relayer_paid_when_not_allowed() {
+        let msg = relayer_paid_message(key(8), key(1), key(2), 1);
+        let err = validate_system_transfer(&msg, &TransferCheck::vault_pays(key(2), 10)).unwrap_err();
+        assert_eq!(err, ShapeError::FeePayerNotSource);
     }
 }

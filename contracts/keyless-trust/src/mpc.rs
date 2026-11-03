@@ -3,8 +3,10 @@
 use near_sdk::serde_json::json;
 use near_sdk::{AccountId, Gas, NearToken, Promise};
 
-/// MPC `sign` is yield/resume. The near-smart-contracts skill attaches 250 TGas.
-pub const MPC_SIGN_GAS: Gas = Gas::from_tgas(250);
+/// Direct `sign` burnt 8.84 TGas on testnet. Milestone 2 attaches 30 TGas
+/// (headroom). The skill's 250 TGas is the yield/resume + callback budget;
+/// this call path is the measured direct sign with a small callback.
+pub const MPC_SIGN_GAS: Gas = Gas::from_tgas(30);
 pub const MPC_CALLBACK_GAS: Gas = Gas::from_tgas(20);
 pub const DERIVE_GAS: Gas = Gas::from_tgas(15);
 pub const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
@@ -90,5 +92,10 @@ mod tests {
             ),
             "B4paagQ87U6kmpn3AoXYaZMQVsFCJbZtjh8tBoKDDXwj"
         );
+    }
+
+    #[test]
+    fn sign_attaches_thirty_tgas() {
+        assert_eq!(MPC_SIGN_GAS.as_tgas(), 30);
     }
 }

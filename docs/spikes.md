@@ -41,7 +41,8 @@ Live decode (same script): 37 219 `PoolConfig` accounts and 96 819 `VirtualP
 
 Host-side `env::used_gas()` after parse + Shape A check: **264 768 111 gas** (~0.26 TGas; `parser_gas_estimate_tgas=0` because the mock reports less than 1 TGas). This is the near-sdk mock runtime, not wasm / near-workspaces. A sandbox gas trace still needs a funded or local near-sandbox binary.
 
-Release wasm: `target/wasm32-unknown-unknown/release/keyless_trust.wasm` **322 671 bytes**.
+Release wasm (day-1): `target/wasm32-unknown-unknown/release/keyless_trust.wasm` **322 671 bytes**.
+Milestone 2 wasm (this PR, unoptimised): **460 739 bytes**. `wasm-opt -Oz`: **251 850 bytes**. Live run of the previous build used **~221 KB**.
 
 ## d) NEAR-signed Solana transfer (end to end)
 
@@ -70,8 +71,135 @@ Full Solana signatures:
 
 The script uses a **local relayer keypair as Solana fee payer** (vault still signs the transfer) and attaches `DEFAULT_MPC_SIGN_TGAS = 30`. CI never runs the MPC call (`EXECUTE_NEAR_SIGNED_TRANSFER` unset → `{ skipped: true }`).
 
+## e) Milestone 2 contract (chip-in / refund / sweep)
+
+`cargo test -p keyless-trust` — unit tests for the state machine, 1% cap math,
+overflow, refund eligibility, relayer-paid Shape A/B, and attacker destinations.
+
+MPC `sign` on the contract path now attaches **30 TGas** (`mpc.rs`), matching
+the live burn of **8.84 TGas**. Callback 20 TGas.
+
+`pnpm deposit-address` (read-only) calls `v1.signer-prod.testnet.derived_public_key`
+for `trust/<id>/in/<pubkey>`. When `CONTRACT_ID` is set it uses the on-chain
+`deposit_address` view first.
+
+near-workspaces is **not** a default-CI dep (no near-sandbox download). The
+practical MPC mock is the unit-test callbacks. See
+`contracts/keyless-trust/tests/sandbox.rs` for the later workspaces recipe.
+
+### Milestone 2 live run
+
+Contract: **`m2.keyless-trust-dev-54ef71.testnet`** (NEARtestnet). Sweep, overflow
+refund, and tampered-destination rejection all worked. Gas **~13.8 TGas** per
+sign call (**8.18 TGas** of it MPC), **~8 s** to signature, **~4 s** to confirm.
+
+| Action | Link |
+| --- | --- |
+| Sweep | [51DxJTpR…8zaRcg](https://explorer.solana.com/tx/51DxJTpRZFyVPgndpeJ4DkK9PhZt5pJuQazqNzhuGbiEdHhLecVnZSgwHvHSejvYmWU3zhJKJoBHt3kYsw8zaRcg?cluster=devnet) |
+| Overflow refund | [5wGFPo3e…oyfJtn](https://explorer.solana.com/tx/5wGFPo3erHFEU7sfMC8eYDUEvphyvjbkee93Lfr8Hxz2HjUFt4DQ3JsFH2L8JHiWecpUSEntxPpCicWU3CoyfJtn?cluster=devnet) |
+| Tampered dest rejected | [6vDKJvPH…uik4t](https://testnet.nearblocks.io/txns/6vDKJvPHEoHn9qZNzvx5CmX6gdFn6SfsJ5CscY9uik4t) |
+
+**B1 (found and fixed):** transfer source was not enforced because
+`deposit_address` was never stored. A refund whose source was the relayer
+wallet was accepted and 0.001 SOL was booked as refunded while the SOL stayed
+in the deposit address:
+[4jqRrYokTwtB3gDDkGKeJvu3WCtaBi4YyxFSmckYx6ez](https://testnet.nearblocks.io/txns/4jqRrYokTwtB3gDDkGKeJvu3WCtaBi4YyxFSmckYx6ez).
+Fix: derive+store deposit / raise / fee keys via MPC callback; reject if
+missing; source must match the stored deposit (or raise vault for
+`request_raise_refund`).
+
+Redeploy after this fix with `scripts/build-wasm.sh` + `pnpm deploy-testnet`
+(storage deposit ≥ 5.5 NEAR, wasm-opt -Oz). Wait for `raise_address` /
+`deposit_address` before sweep/refund, then `confirm_transfer` after Solana
+lands. `release_pending` after ~150s (past the Solana blockhash lifetime)
+unlocks a re-sign. A later sign of the same lock **supersedes** released
+hashes (`pending superseded`). An honest late confirm with no re-sign still
+books.
+
+### Milestone 2 live rerun (`b20adfe` on m3)
+
+Contract: **`m3.keyless-trust-dev-54ef71.testnet`**. Every flow and must-fail
+check passed. Gas **~14.1 TGas** per sign call.
+
+| Action | Link |
+| --- | --- |
+| Sweep | [3DGKcmod…LPK9fv](https://explorer.solana.com/tx/3DGKcmodF7JFURqz5Cnta3DBUicFCCYj26yxWWvcH6wmeeiidLHXdgfRM1X2g7Twiz8tBkD1j4VNqQ3c27LPK9fv?cluster=devnet) |
+| Raise refund | [Fq8EWk3g…LePjKr](https://explorer.solana.com/tx/Fq8EWk3ge3Wy9HxvKDraDSZVQPypC92BC3fRZrNC9KpucLXBqKHFXpQqq7jfjBvVpk9VJcDGqKsE6pGApLePjKr?cluster=devnet) |
+| B1 now rejected | [Zkw4EyQv…Mc8W4TY](https://testnet.nearblocks.io/txns/Zkw4EyQvaoBQAxVTUdG3ELX4NoyYX8SYzuecMc8W4TY) |
+
+**N1 (found; budget check was not enough):** a released pending could be
+confirmed after a re-sign had already settled the same budget, double-booking
+(`refunded=10M` against `overflow=5M`):
+[DjhtE5ZURR7ksn3urEgSv4LbZF65AgCEqXY8iTVHVPjh](https://testnet.nearblocks.io/txns/DjhtE5ZURR7ksn3urEgSv4LbZF65AgCEqXY8iTVHVPjh)
+(released hash `220b0699…`, reused the re-sign's Solana sig). Sig de-dupe +
+remaining-budget check shipped on m4; a **partial** re-sign after a state
+change still left room. Closed on this commit: each lock has a nonce; a new
+sign supersedes earlier released entries (`pending superseded`).
+
+**N2 (found and fixed):** in Refunding, `refundable` ignored a pending
+unconfirmed sweep, so a refund and a sweep of the same lamports could both
+be signed. Pending sweeps now reduce `refundable` only in Refunding (same
+pot). `sweepable` does not subtract a pending overflow refund.
+
+**N3 (found and fixed):** `register` took 1 yocto and settled pendings were
+never pruned. `register` requires **0.005 NEAR**; sign requests require
+**0.01 NEAR** (live sign needed ~0.0043; 0.001 failed). Excess is refunded.
+
+Deploy no longer leaves the parent's full-access key on the contract.
+`DEPLOY_KEEP_KEY=1` restores the old behaviour.
+
+### Milestone 2 live rerun (`4b5ec17` on m4)
+
+Contract: **`m4.keyless-trust-dev-54ef71.testnet`**. No access keys. N2, N3
+and every regression passed. N1 still open: a late confirm of a released
+hash with a fake unused `solana_sig` was accepted after a partial re-sign
+left leftover budget (nearblocks `AMDGKAuV…`). Sign with exactly
+`sign_deposit()` 0.001 NEAR failed (`56VuXGAR…`, needed ~0.0043). Both
+closed in this commit. Redeploy as **m5**.
+
+### Milestone 2 live rerun (`6514056` on m5)
+
+Contract: **`m5.keyless-trust-dev-54ef71.testnet`**. Deployed
+[B2aH2JZi…](https://testnet.nearblocks.io/txns/B2aH2JZixb5ujV79yK5Xb5Uoj4pPBbgNMGydyjhkwBgU)
+(5.5 NEAR, no full-access key; RPC `view_access_key_list` is empty). Storage
+**258.05 kB**. 47 transactions.
+
+N4 deposits work on-chain: `register` **0.005 NEAR** and sign requests
+**0.01 NEAR**. Late confirms of already-settled or reused-sig hashes fail.
+A leftover-budget late confirm is rejected (`amount exceeds remaining budget`).
+
+| Action | Link |
+| --- | --- |
+| Deploy (FINAL, keyless) | [B2aH2JZi…](https://testnet.nearblocks.io/txns/B2aH2JZixb5ujV79yK5Xb5Uoj4pPBbgNMGydyjhkwBgU) |
+| `register` 0.005 | [7JQGFrAU…](https://testnet.nearblocks.io/txns/7JQGFrAU4QU8LSfEh9AwBqLA8671LY2jqzbRQKJC9oLN) |
+| Sweep sign 0.01 | [CS3Pf5Sv…](https://testnet.nearblocks.io/txns/CS3Pf5SvMxcaMzQYdWHb5UYENehnArupcxbRNoAxVPgK) |
+| Refund sign 0.01 | [8XNzWdq9…](https://testnet.nearblocks.io/txns/8XNzWdq92cbKSQzqLhb2tdiB6N29cAD8YGuVJqxAbhWH) |
+| Confirm landed | [2VomgvdQ…](https://testnet.nearblocks.io/txns/2VomgvdQbRV18ESP7E97QU6R48bsUuyyR9c5AWMKHuxH) · Solana [48xKqVuC…](https://explorer.solana.com/tx/48xKqVuCsQ1uxsaRyVDFFj5bXfvYkhV94RnirT2oqeWGwctqZJ1mkPPCA5Bi5zdC72iPSqofjPAXooJfhHmfeRP8?cluster=devnet) |
+| Confirm after release | [FfdcXicq…](https://testnet.nearblocks.io/txns/FfdcXicqrhuqJudrQcwZf915kbSmQP7uNhZ5HH31eph6) · Solana [C39F8Yxx…](https://explorer.solana.com/tx/C39F8Yxxqtnfqx2YYc1nSsnKYB3LGgMc7gZiSRM7RaPAw49GREmJpBfhK8VtcZeVMCGTUyv1mdZegNVG28rhBhb?cluster=devnet) |
+| Must-fail: already settled | [6cXB4Mp2…](https://testnet.nearblocks.io/txns/6cXB4Mp2mjC8xgBLpfTv3kY69VFywiHEwxN5Pwwysjnb) |
+| Must-fail: sig reused | [F4FV1Kqx…](https://testnet.nearblocks.io/txns/F4FV1Kqx1QLh4Qidt5T919H1EH5kevhjgJZYF8K8yf7w) |
+| Must-fail: leftover budget | [AMPQ9RrR…](https://testnet.nearblocks.io/txns/AMPQ9RrRPeCzRitaTuCpNpxyUJjQ6XG4j1WLcxQvEQLT) |
+
+Account: [m5.keyless-trust-dev-54ef71.testnet](https://testnet.nearblocks.io/address/m5.keyless-trust-dev-54ef71.testnet).
+
+### Deploy script
+
+```bash
+scripts/build-wasm.sh
+NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
+NEAR_PRIVATE_KEY=ed25519:... \
+DEPLOY_SUBACCOUNT=m5 \
+EXECUTE_DEPLOY=1 \
+pnpm deploy-testnet
+# → m5.keyless-trust-dev-54ef71.testnet
+# wrapper: scripts/deploy-testnet.sh
+# DEPLOY_NEAR overrides the computed floor (5.5)
+# DEPLOY_KEEP_KEY=1 leaves a full-access key (off by default)
+# Script waits for the deploy tx to be FINAL before returning
+```
+
 ## Still needs funded testnet / devnet accounts
 
 - A human-created NEAR testnet account to **deploy** `keyless-trust` (the e2e `sign` used `keyless-trust-dev-54ef71.testnet` as predecessor, not a deployed contract)
 - A paid or created DBC **config** (createConfig2) that this Trust pins; dummy keys cannot initialise a pool
-- Landing create-and-buy, sweeps, refunds, and a near-workspaces gas trace
+- Landing create-and-buy, live sweeps/refunds from the deployed contract, and a near-workspaces gas trace

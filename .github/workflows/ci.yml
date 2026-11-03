@@ -15,8 +15,10 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Unit tests
         run: cargo test --workspace
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Wasm build
-        run: cargo build -p keyless-trust --target wasm32-unknown-unknown --release
+        run: scripts/build-wasm.sh
 
   node:
     runs-on: ubuntu-latest

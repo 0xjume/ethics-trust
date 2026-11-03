@@ -56,7 +56,13 @@ Meteora BUILD rules that still apply: `@solana/web3.js` v1 only (not `@solana/ki
 
 `cargo-near` was not installed in the agent image. The crate layout matches the `cargo near new` template (cdylib+rlib, overflow-checks on workspace `[profile.release]` / `[profile.dev]`, wasm32). Do not invent a different layout.
 
-Day-1 audit against `.agents/skills/near-contract-audit`: callbacks are `#[private]`; `request_refund_sign` and `register` take 1 yoctoNEAR; unique map prefix `t`; `#[init]` + `PanicOnDefault`; no `Default` impl that skips init. `register` does **not** yet persist contributors (scaffold). `request_refund_sign` currently labels the path with hex of the 32-byte source; a later PR must persist the base58 pubkey from `register`.
+Day-1 audit against `.agents/skills/near-contract-audit`: callbacks are `#[private]`; `report_deposit` / `confirm_transfer` take 1 yoctoNEAR; `register` takes 0.005 NEAR and sign requests take 0.01 NEAR (excess refunded); unique map prefixes `t` (trusts), `c` (ledger), `s` (seen sigs), `p` (pending), `k` (locks), `h` (consumed hashes), `n` (lock nonces), `r` (last released); `#[init]` + `PanicOnDefault`; no `Default` impl that skips init.
+
+Milestone 2 (post live test): `create_trust(config)` **requires a watcher** and kicks off `derived_public_key` for `trust/<id>/raise` and `/fees`. `register` / first `report_deposit` derive `trust/<id>/in/<pubkey>` and store `deposit_address`. Sweep/refund **reject** if that address is missing; the transfer source must match it (B1). The ledger is not debited on `sign`: a pending row keyed by `sha256(message)` is locked until the watcher calls `confirm_transfer(message_hash, solana_sig)`. After **150 s** anyone may `release_pending`. A later sign of the same lock increments a per-lock nonce and marks earlier released rows **superseded** (N1). An honest late confirm with no re-sign still books. Settled rows are pruned into `consumed_hashes`. Overflow is refundable in Raising, Filled and Executing. Pending sweeps reduce `refundable` only in Refunding (N2). Swept SOL is refundable from the raise vault in Refunding (`request_raise_refund`). Views and `confirm_transfer` apply timeouts lazily.
+
+**Watcher trust assumption:** NEAR cannot see Solana. The watcher can delay a raise, under/over-report deposits among real contributors, and delay `confirm_transfer`. It cannot change destinations: every signed transfer source and dest is a stored derived key or the contributor's own pubkey. Anyone can run a second watcher to audit reports against explorers. This is the PLAN §4 trust point, restated after R1.
+
+**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): this PR is **251 850 bytes** after -Oz (460 739 before). The previous live deploy measured ~221 KB.
 
 ## MPC `sign` gas and Solana fee payer (3 Nov 2026)
 
@@ -69,11 +75,11 @@ Explorer links: `docs/spikes.md`.
 | Decision | Why |
 | --- | --- |
 | Relayer keypair is the Solana **fee payer** and signs locally | Vault balance dropped by **exactly 1 000 000 lamports** each run. The vault still signs the System transfer as source. |
-| Direct `sign` attaches **30 TGas** (`DEFAULT_MPC_SIGN_TGAS`, overridable via `MPC_SIGN_TGAS`) | Burnt gas was **8.84 TGas** each time. 30 is enough headroom. The contract still attaches 250 TGas for yield/resume + callback (`mpc.rs`), which is a different call path. |
+| Direct `sign` attaches **30 TGas** (`DEFAULT_MPC_SIGN_TGAS` and `mpc.rs` `MPC_SIGN_GAS`) | Burnt gas was **8.84 TGas** each time. 30 is enough headroom. Callbacks still get 20 TGas. |
 | No durable nonce | Sign 6.8–7.5 s, send→confirmed ~2.6 s, total ~14 s. The blockhash stayed valid. |
 | Devnet submit **works** | Three confirmed transfers. CI still refuses to call `sign` or submit unless `EXECUTE_NEAR_SIGNED_TRANSFER=1` (and `SOLANA_SUBMIT=1` for send). |
 
-The on-chain Shape A checker still requires fee-payer = source (refunds). The e2e spike and later vault spends that must keep an exact balance use the relayer-paid shape instead.
+On-chain Shapes A / A2 / B accept a relayer fee payer and **require** the stored vault as transfer source. Vault-paid (fee payer = source) still passes.
 
 ## Networks
 
