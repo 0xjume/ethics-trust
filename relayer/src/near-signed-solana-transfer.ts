@@ -1,25 +1,30 @@
 /**
- * NEAR-signed Solana devnet transfer — DO NOT RUN in CI or this environment.
+ * NEAR-signed Solana transfer — DO NOT RUN the MPC call in CI.
  *
- * Needs a funded NEAR testnet account (1 yocto + gas) and a funded Solana
- * devnet keypair only as an optional co-signer / destination. The derived
- * vault must already hold SOL. This script is the day-1 spike (d) recipe.
+ * The derived vault is a required signer of the System transfer. A separate
+ * relayer keypair is the Solana fee payer and signs locally, so the vault
+ * balance changes by exactly `lamports` (no fee deducted from the vault).
  *
  * Env:
  *   NEAR_ACCOUNT_ID, NEAR_PRIVATE_KEY
  *   NEAR_RPC_URL (default testnet)
  *   MPC_CONTRACT (default v1.signer-prod.testnet)
- *   NEAR_PREDECESSOR (account that owns the path; usually the Trust contract)
- *   TRUST_PATH (default trust/0/raise)
+ *   NEAR_PREDECESSOR (account that owns the path)
+ *   TRUST_PATH (default trust/1/raise)
+ *   MPC_SIGN_TGAS (default DEFAULT_MPC_SIGN_TGAS)
  *   SOLANA_RPC_URL (default devnet)
+ *   SOLANA_RELAYER_KEYPAIR / SOLANA_KEYPAIR_PATH — JSON secret-key array
  *   SOLANA_TRANSFER_TO (base58)
  *   SOLANA_TRANSFER_LAMPORTS (default 5000)
+ *   SOLANA_SUBMIT=1 to send after local verify (needs relayer SOL on devnet)
  *
- * Measures: NEAR gas attached, wall-clock latency of sign + submit.
+ * Live sign measurements (no Solana submit): docs/spikes.md.
  */
+import { readFileSync } from "node:fs";
 import { Account, JsonRpcProvider, KeyPairString, teraToGas } from "near-api-js";
 import {
   Connection,
+  Keypair,
   PublicKey,
   SystemProgram,
   Transaction,
@@ -31,6 +36,46 @@ import {
   viewDerivedPublicKey,
 } from "./near-rpc.ts";
 
+/** Attached gas for a direct `sign` on the MPC contract. Live burn was 8.84 TGas. */
+export const DEFAULT_MPC_SIGN_TGAS = 30;
+
+export function resolveAttachedTgas(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.MPC_SIGN_TGAS;
+  if (raw === undefined || raw === "") {
+    return DEFAULT_MPC_SIGN_TGAS;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error("MPC_SIGN_TGAS must be a positive number");
+  }
+  return value;
+}
+
+export function buildRelayerPaidVaultTransfer(params: {
+  relayer: PublicKey;
+  vault: PublicKey;
+  destination: PublicKey;
+  lamports: number;
+  blockhash: string;
+}): Transaction {
+  if (params.relayer.equals(params.vault)) {
+    throw new Error("relayer fee payer must be a different key from the vault");
+  }
+  const tx = new Transaction();
+  tx.feePayer = params.relayer;
+  tx.recentBlockhash = params.blockhash;
+  tx.add(
+    SystemProgram.transfer({
+      fromPubkey: params.vault,
+      toPubkey: params.destination,
+      lamports: params.lamports,
+    }),
+  );
+  return tx;
+}
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -39,15 +84,32 @@ function requireEnv(name: string): string {
   return value;
 }
 
+function loadRelayerKeypair(): Keypair {
+  const path =
+    process.env.SOLANA_RELAYER_KEYPAIR ?? process.env.SOLANA_KEYPAIR_PATH;
+  if (!path) {
+    throw new Error(
+      "Set SOLANA_RELAYER_KEYPAIR (JSON secret-key file) for the local fee payer.",
+    );
+  }
+  const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!Array.isArray(raw) || raw.some((n) => typeof n !== "number")) {
+    throw new Error("relayer keypair file must be a JSON array of secret-key bytes");
+  }
+  return Keypair.fromSecretKey(Uint8Array.from(raw));
+}
+
 export async function runNearSignedSolanaTransfer(): Promise<void> {
   const started = Date.now();
   const accountId = requireEnv("NEAR_ACCOUNT_ID");
   const privateKey = requireEnv("NEAR_PRIVATE_KEY") as KeyPairString;
   const destination = new PublicKey(requireEnv("SOLANA_TRANSFER_TO"));
   const predecessor = process.env.NEAR_PREDECESSOR ?? accountId;
-  const path = process.env.TRUST_PATH ?? "trust/0/raise";
+  const path = process.env.TRUST_PATH ?? "trust/1/raise";
   const lamports = Number(process.env.SOLANA_TRANSFER_LAMPORTS ?? "5000");
   const solanaRpc = process.env.SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
+  const attachedTgas = resolveAttachedTgas();
+  const relayer = loadRelayerKeypair();
 
   const nearKey = await viewDerivedPublicKey({
     path,
@@ -55,22 +117,30 @@ export async function runNearSignedSolanaTransfer(): Promise<void> {
     domain_id: 1,
   });
   const vault = new PublicKey(solanaAddressFromNearKey(nearKey));
-  console.log(JSON.stringify({ derivedVault: vault.toBase58(), path, predecessor }));
+  if (relayer.publicKey.equals(vault)) {
+    throw new Error("relayer keypair must not be the derived vault");
+  }
+  console.log(
+    JSON.stringify({
+      derivedVault: vault.toBase58(),
+      relayerFeePayer: relayer.publicKey.toBase58(),
+      path,
+      predecessor,
+      attachedTgas,
+    }),
+  );
 
   const connection = new Connection(solanaRpc, "confirmed");
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(
     "confirmed",
   );
-  const tx = new Transaction();
-  tx.feePayer = vault;
-  tx.recentBlockhash = blockhash;
-  tx.add(
-    SystemProgram.transfer({
-      fromPubkey: vault,
-      toPubkey: destination,
-      lamports,
-    }),
-  );
+  const tx = buildRelayerPaidVaultTransfer({
+    relayer: relayer.publicKey,
+    vault,
+    destination,
+    lamports,
+    blockhash,
+  });
   const message = tx.serializeMessage();
   const payloadHex = Buffer.from(message).toString("hex");
 
@@ -80,7 +150,6 @@ export async function runNearSignedSolanaTransfer(): Promise<void> {
   const account = new Account(accountId, provider, privateKey);
 
   const signStarted = Date.now();
-  const attachedTgas = 250;
   const result = await account.callFunction({
     contractId: MPC_CONTRACT,
     methodName: "sign",
@@ -98,8 +167,35 @@ export async function runNearSignedSolanaTransfer(): Promise<void> {
 
   const signatureBytes = extractEd25519Signature(result);
   tx.addSignature(vault, Buffer.from(signatureBytes));
+  tx.partialSign(relayer);
   if (!tx.verifySignatures()) {
     throw new Error("assembled Solana signatures failed local verify");
+  }
+
+  const report: Record<string, unknown> = {
+    derivedVault: vault.toBase58(),
+    relayerFeePayer: relayer.publicKey.toBase58(),
+    attachedTgas,
+    messageBytes: message.length,
+    signMs,
+    vaultSignatureVerified: true,
+  };
+
+  if (process.env.SOLANA_SUBMIT !== "1") {
+    console.log(
+      JSON.stringify(
+        {
+          ...report,
+          submitted: false,
+          reason:
+            "Solana submit skipped. Public devnet airdrop is closed; faucet.solana.com needs GitHub auth. Set SOLANA_SUBMIT=1 once the relayer has devnet SOL.",
+          totalMs: Date.now() - started,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
   }
 
   const submitStarted = Date.now();
@@ -110,15 +206,14 @@ export async function runNearSignedSolanaTransfer(): Promise<void> {
     { signature, blockhash, lastValidBlockHeight },
     "confirmed",
   );
-  const submitMs = Date.now() - submitStarted;
-
   console.log(
     JSON.stringify(
       {
+        ...report,
+        submitted: true,
         solanaSignature: signature,
-        attachedTgas,
-        signMs,
-        submitMs,
+        submitMs: Date.now() - submitStarted,
+        lastValidBlockHeight,
         totalMs: Date.now() - started,
         explorer: `https://solscan.io/tx/${signature}?cluster=devnet`,
       },
@@ -148,7 +243,7 @@ if (isMain) {
         {
           skipped: true,
           reason:
-            "Refusing to run: needs a funded NEAR testnet account and a funded derived Solana vault. Set EXECUTE_NEAR_SIGNED_TRANSFER=1 after exporting the env vars in .env.example.",
+            "Refusing to run: needs a funded NEAR testnet account. Set EXECUTE_NEAR_SIGNED_TRANSFER=1 after exporting the env vars in .env.example. Solana submit additionally needs SOLANA_SUBMIT=1 and relayer SOL.",
         },
         null,
         2,

@@ -58,6 +58,21 @@ Meteora BUILD rules that still apply: `@solana/web3.js` v1 only (not `@solana/ki
 
 Day-1 audit against `.agents/skills/near-contract-audit`: callbacks are `#[private]`; `request_refund_sign` and `register` take 1 yoctoNEAR; unique map prefix `t`; `#[init]` + `PanicOnDefault`; no `Default` impl that skips init. `register` does **not** yet persist contributors (scaffold). `request_refund_sign` currently labels the path with hex of the 32-byte source; a later PR must persist the base58 pubkey from `register`.
 
+## MPC `sign` gas and Solana fee payer (3 Nov 2026)
+
+Live, three runs on NEAR **testnet** against `v1.signer-prod.testnet` `sign`:
+`domain_id = 1`, path `trust/1/raise`, payload = a 150-byte legacy Solana
+System transfer. Numbers and explorer links: `docs/spikes.md`.
+
+| Decision | Why |
+| --- | --- |
+| Relayer keypair is the Solana **fee payer** and signs locally | Vault lamports then change by exactly the transfer amount. The vault still signs the System transfer as source. |
+| Direct `sign` attaches **30 TGas** (`DEFAULT_MPC_SIGN_TGAS`, overridable via `MPC_SIGN_TGAS`) | Burnt gas was **8.84 TGas** each time. 30 is enough headroom. The contract still attaches 250 TGas for yield/resume + callback (`mpc.rs`), which is a different call path. |
+| No durable nonce yet | After 7.1–7.8 s to NEAR finality the Solana blockhash still had ~110 valid slots. Revisit if sign latency grows. |
+| Devnet **submit** stays pending | Public `api.devnet.solana.com` airdrop is closed; `faucet.solana.com` needs GitHub auth. Signatures verified locally against the derived vault. |
+
+The on-chain Shape A checker still requires fee-payer = source (refunds). The e2e spike and later vault spends that must keep an exact balance use the relayer-paid shape instead.
+
 ## Networks
 
 Testnet (NEAR) and Solana **devnet** only. MPC: `v1.signer-prod.testnet`, `domain_id = 1` (Ed25519), `payload_v2.Eddsa`.

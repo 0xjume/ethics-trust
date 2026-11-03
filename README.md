@@ -32,10 +32,11 @@ pnpm dbc-tx-size               # builds txs, does not send
 pnpm dev:app                   # placeholder Trust room (Ethics Launch tokens)
 ```
 
-The unexecuted end-to-end MPC transfer (needs a testnet account and a funded
-derived vault) is `relayer/src/near-signed-solana-transfer.ts`. Do not run it
-unless you set `EXECUTE_NEAR_SIGNED_TRANSFER=1` and the env vars in
-`.env.example`.
+The MPC transfer script is `relayer/src/near-signed-solana-transfer.ts`. Three
+live `sign` calls already landed on NEAR testnet (see `docs/spikes.md`). Do not
+run it here unless you set `EXECUTE_NEAR_SIGNED_TRANSFER=1`. Solana submit
+additionally needs `SOLANA_SUBMIT=1` and relayer SOL — the public devnet
+airdrop is closed.
 
 ## Do X, see Y (judge steps)
 
