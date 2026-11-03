@@ -20,12 +20,13 @@ fi
 if [[ -z "${NEAR_ACCOUNT_ID:-}" || -z "${NEAR_PRIVATE_KEY:-}" ]]; then
   echo "NEAR_ACCOUNT_ID and NEAR_PRIVATE_KEY are not set." >&2
   echo "Build the wasm, then re-run with those env vars and EXECUTE_DEPLOY=1:" >&2
-  echo "  cargo build -p keyless-trust --target wasm32-unknown-unknown --release" >&2
+  echo "  scripts/build-wasm.sh" >&2
   echo "  EXECUTE_DEPLOY=1 pnpm --filter @keyless-trust/relayer deploy-testnet" >&2
   echo "Target: \${DEPLOY_SUBACCOUNT:-m2}.\${NEAR_ACCOUNT_ID:-keyless-trust-dev-54ef71.testnet}" >&2
+  echo "Override deposit with DEPLOY_NEAR (floor 5.5)." >&2
   exit 2
 fi
 
-cargo build -p keyless-trust --target wasm32-unknown-unknown --release
+"$ROOT/scripts/build-wasm.sh"
 export EXECUTE_DEPLOY="${EXECUTE_DEPLOY:-1}"
 exec pnpm --filter @keyless-trust/relayer deploy-testnet

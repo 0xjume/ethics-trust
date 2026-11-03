@@ -57,9 +57,8 @@ already produce real numbers.
    `sdkMatchesDevnet: true` for `@meteora-ag/dynamic-bonding-curve-sdk@2.0.0`,
    the DBC program executable on devnet, and legacy createConfig2 / create-and-buy
    messages under 1232 bytes (measured 533 and 811).
-3. **Do** `cargo test -p keyless-trust`. **See** the parser and ledger reject
-   an attacker destination, cap overflow, and refund-while-raising of credited
-   funds.
+3. **Do** `cargo test -p keyless-trust`. **See** the parser reject an attacker
+   destination or a fee-payer-as-source, plus cap overflow and pending settle.
 4. **Do** open the Proof links above. **See** a NEAR `sign` and a Solana
    **devnet** transfer from the keyless vault, with the relayer as fee payer.
 5. **Do** `pnpm deposit-address`. **See** `trust/1/in/<pubkey>` plus the

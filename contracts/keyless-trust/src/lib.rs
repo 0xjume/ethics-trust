@@ -17,8 +17,8 @@ pub mod shapes;
 pub mod solana;
 
 use math::{
-    refundable_lamports, split_deposit, sweepable_lamports, DEFAULT_CAP_BPS, DEFAULT_FILL_FEE_BPS,
-    EXECUTION_TIMEOUT_NS,
+    raise_refundable_lamports, refundable_lamports, split_deposit, sweepable_lamports,
+    DEFAULT_CAP_BPS, DEFAULT_FILL_FEE_BPS, EXECUTION_TIMEOUT_NS, PENDING_EXPIRY_NS,
 };
 use mpc::{
     contributor_path, derive_path, derived_public_key_promise, sign_eddsa_promise, DOMAIN_ED25519,
@@ -32,6 +32,8 @@ const DEFAULT_DBC: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
 const STORAGE_PREFIX_TRUSTS: &[u8] = b"t";
 const STORAGE_PREFIX_LEDGER: &[u8] = b"c";
 const STORAGE_PREFIX_SIGS: &[u8] = b"s";
+const STORAGE_PREFIX_PENDING: &[u8] = b"p";
+const STORAGE_PREFIX_LOCKS: &[u8] = b"k";
 
 #[near(serializers = [json, borsh])]
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -55,7 +57,7 @@ pub struct CreateTrustConfig {
     pub cap_bps: Option<u16>,
     pub fill_fee_bps: Option<u16>,
     pub execution_timeout_ns: Option<u64>,
-    pub watcher: Option<AccountId>,
+    pub watcher: AccountId,
 }
 
 #[near(serializers = [json, borsh])]
@@ -80,7 +82,7 @@ pub struct Trust {
     pub params_hash: String,
     pub credited_total: u64,
     pub overflow_total: u64,
-    pub watcher: Option<AccountId>,
+    pub watcher: AccountId,
     pub state: TrustState,
 }
 
@@ -106,7 +108,7 @@ pub struct TrustView {
     pub params_hash: String,
     pub credited_total: u64,
     pub overflow_total: u64,
-    pub watcher: Option<AccountId>,
+    pub watcher: AccountId,
     pub state: TrustState,
 }
 
@@ -150,7 +152,20 @@ pub struct Contribution {
     pub overflow_lamports: u64,
     pub swept_lamports: u64,
     pub refunded_lamports: u64,
+    pub raise_refunded_lamports: u64,
     pub last_solana_sig: String,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingTransfer {
+    pub trust_id: u64,
+    pub contributor: String,
+    pub kind: String,
+    pub lamports: u64,
+    pub message_hash: String,
+    pub expires_at_ns: u64,
+    pub settled: bool,
 }
 
 #[near(serializers = [json, borsh])]
@@ -173,10 +188,16 @@ pub struct Contract {
     trusts: IterableMap<u64, Trust>,
     ledger: IterableMap<String, Contribution>,
     seen_sigs: LookupMap<String, u64>,
+    pending: LookupMap<String, PendingTransfer>,
+    locks: LookupMap<String, String>,
 }
 
 fn ledger_key(trust_id: u64, contributor: &str) -> String {
     format!("{trust_id}:{contributor}")
+}
+
+fn lock_key(trust_id: u64, contributor: &str, kind: &str) -> String {
+    format!("{trust_id}:{contributor}:{kind}")
 }
 
 fn pin_params_hash(dbc_config: &str, name: &str, symbol: &str, uri: &str) -> String {
@@ -210,6 +231,8 @@ impl Contract {
             trusts: IterableMap::new(STORAGE_PREFIX_TRUSTS),
             ledger: IterableMap::new(STORAGE_PREFIX_LEDGER),
             seen_sigs: LookupMap::new(STORAGE_PREFIX_SIGS),
+            pending: LookupMap::new(STORAGE_PREFIX_PENDING),
+            locks: LookupMap::new(STORAGE_PREFIX_LOCKS),
         }
     }
 
@@ -323,6 +346,9 @@ impl Contract {
             state: TrustState::Raising,
         };
         self.trusts.insert(id, trust);
+        let _ = self
+            .kick_derive(id, "raise", None)
+            .and(self.kick_derive(id, "fees", None));
 
         env::log_str(&format!(
             "EVENT_JSON:{{\"standard\":\"keyless-trust\",\"version\":\"0.2.0\",\"event\":\"trust_created\",\"data\":[{{\"trust_id\":{id}}}]}}"
@@ -339,7 +365,11 @@ impl Contract {
         );
         require!(self.trusts.contains_key(&trust_id), "unknown trust");
         let _ = require_pubkey(&solana_pubkey);
-        let path = self.ensure_contribution(trust_id, &solana_pubkey).deposit_path;
+        let row = self.ensure_contribution(trust_id, &solana_pubkey);
+        if row.deposit_address.is_none() {
+            let _ = self.kick_derive(trust_id, "in", Some(solana_pubkey.clone()));
+        }
+        let path = row.deposit_path;
         env::log_str(&format!(
             "EVENT_JSON:{{\"standard\":\"keyless-trust\",\"version\":\"0.2.0\",\"event\":\"registered\",\"data\":[{{\"trust_id\":{trust_id},\"path\":\"{path}\"}}]}}"
         ));
@@ -380,18 +410,19 @@ impl Contract {
                 trust.state.clone(),
             )
         };
-        if let Some(expected) = watcher {
-            require!(
-                env::predecessor_account_id() == expected,
-                "only the trusted watcher can report deposits"
-            );
-        }
+        require!(
+            env::predecessor_account_id() == watcher,
+            "only the trusted watcher can report deposits"
+        );
         require!(
             state != TrustState::Launched,
             "cannot report deposits after launch"
         );
 
         let mut row = self.ensure_contribution(trust_id, &contributor);
+        if row.deposit_address.is_none() {
+            let _ = self.kick_derive(trust_id, "in", Some(contributor.clone()));
+        }
         let split = if state == TrustState::Raising {
             split_deposit(
                 lamports,
@@ -452,7 +483,21 @@ impl Contract {
                 row.overflow_lamports,
                 row.swept_lamports,
                 row.refunded_lamports,
-            ),
+            )
+            .saturating_sub(self.pending_amount(trust_id, &contributor, "refund")),
+            None => 0,
+        }
+    }
+
+    pub fn raise_refundable(&self, trust_id: u64, contributor: String) -> u64 {
+        let trust = self.trusts.get(&trust_id).expect("unknown trust");
+        match self.ledger.get(&ledger_key(trust_id, &contributor)) {
+            Some(row) => raise_refundable_lamports(
+                &trust.state,
+                row.swept_lamports,
+                row.raise_refunded_lamports,
+            )
+            .saturating_sub(self.pending_amount(trust_id, &contributor, "raise_refund")),
             None => 0,
         }
     }
@@ -465,21 +510,33 @@ impl Contract {
     pub fn sweepable(&self, trust_id: u64, contributor: String) -> u64 {
         let trust = self.trusts.get(&trust_id).expect("unknown trust");
         match self.ledger.get(&ledger_key(trust_id, &contributor)) {
-            Some(row) => sweepable_lamports(&trust.state, row.credited_lamports, row.swept_lamports),
+            Some(row) => sweepable_lamports(&trust.state, row.credited_lamports, row.swept_lamports)
+                .saturating_sub(self.pending_amount(trust_id, &contributor, "sweep")),
             None => 0,
         }
     }
 
+    pub fn get_pending(&self, message_hash: String) -> Option<PendingTransfer> {
+        self.pending.get(&message_hash).cloned()
+    }
+
     /// Ask the MPC signer for the derived Ed25519 key of a Trust path.
-    pub fn request_derived_key(&self, trust_id: u64, kind: String) -> Promise {
+    /// `kind` is `raise`, `fees`, or `in` (then `contributor` is required).
+    pub fn request_derived_key(
+        &self,
+        trust_id: u64,
+        kind: String,
+        contributor: Option<String>,
+    ) -> Promise {
         require!(self.trusts.contains_key(&trust_id), "unknown trust");
-        require!(kind == "raise" || kind == "fees", "kind must be raise or fees");
-        let path = derive_path(trust_id, &kind);
-        derived_public_key_promise(self.mpc_contract.clone(), path, env::current_account_id()).then(
-            Self::ext(env::current_account_id())
-                .with_static_gas(Gas::from_tgas(10))
-                .on_derived_public_key(trust_id, kind),
-        )
+        require!(
+            kind == "raise" || kind == "fees" || kind == "in",
+            "kind must be raise, fees, or in"
+        );
+        if kind == "in" {
+            require!(contributor.is_some(), "contributor required for kind=in");
+        }
+        self.kick_derive(trust_id, &kind, contributor)
     }
 
     /// Validate a relayer-paid (or vault-paid) sweep into the raise vault,
@@ -498,10 +555,23 @@ impl Contract {
         let dest = self.raise_dest(trust_id);
         let max = self.sweepable(trust_id, contributor.clone());
         require!(max > 0, "nothing to sweep");
-        let source = self.optional_deposit_source(trust_id, &contributor);
-        let checked = self.check_transfer(&message.0, dest, max, source, true);
-        self.book_sweep(trust_id, &contributor, checked.lamports);
-        self.sign_vault_tx(trust_id, &contributor, "sweep", checked.lamports, &message.0)
+        let source = self.require_deposit_source(trust_id, &contributor);
+        let checked = self.check_transfer(&message.0, dest, max, Some(source), true);
+        self.lock_pending(trust_id, &contributor, "sweep", checked.lamports, &message.0);
+        if let Some(trust) = self.trusts.get_mut(&trust_id) {
+            if trust.state == TrustState::Filled {
+                trust.state = TrustState::Executing;
+                trust.execution_started_ns = Some(env::block_timestamp());
+            }
+        }
+        self.sign_vault_tx(
+            contributor_path(trust_id, &contributor),
+            trust_id,
+            &contributor,
+            "sweep",
+            checked.lamports,
+            &message.0,
+        )
     }
 
     /// Raising: refund uncredited overflow only. Refunding: everything not
@@ -518,10 +588,100 @@ impl Contract {
         let dest = require_pubkey(&contributor);
         let max = self.refundable(trust_id, contributor.clone());
         require!(max > 0, "nothing to refund");
-        let source = self.optional_deposit_source(trust_id, &contributor);
-        let checked = self.check_transfer(&message.0, dest, max, source, true);
-        self.book_refund(trust_id, &contributor, checked.lamports);
-        self.sign_vault_tx(trust_id, &contributor, "refund", checked.lamports, &message.0)
+        let source = self.require_deposit_source(trust_id, &contributor);
+        let checked = self.check_transfer(&message.0, dest, max, Some(source), true);
+        self.lock_pending(trust_id, &contributor, "refund", checked.lamports, &message.0);
+        self.sign_vault_tx(
+            contributor_path(trust_id, &contributor),
+            trust_id,
+            &contributor,
+            "refund",
+            checked.lamports,
+            &message.0,
+        )
+    }
+
+    /// Refunding only: move swept SOL from the raise vault back to the
+    /// contributor, pro-rata by the amount already swept (credited share).
+    #[payable]
+    pub fn request_raise_refund(
+        &mut self,
+        trust_id: u64,
+        contributor: String,
+        message: Base64VecU8,
+    ) -> Promise {
+        require!(env::attached_deposit() >= ONE_YOCTO, "attach 1 yoctoNEAR");
+        self.apply_timeouts(trust_id);
+        let dest = require_pubkey(&contributor);
+        let max = self.raise_refundable(trust_id, contributor.clone());
+        require!(max > 0, "nothing to refund from raise vault");
+        let source = self.raise_dest(trust_id);
+        let checked = self.check_transfer(&message.0, dest, max, Some(source), true);
+        self.lock_pending(
+            trust_id,
+            &contributor,
+            "raise_refund",
+            checked.lamports,
+            &message.0,
+        );
+        let path = self
+            .trusts
+            .get(&trust_id)
+            .expect("unknown trust")
+            .raise_path
+            .clone();
+        self.sign_vault_tx(
+            path,
+            trust_id,
+            &contributor,
+            "raise_refund",
+            checked.lamports,
+            &message.0,
+        )
+    }
+
+    /// Watcher reports that the signed Solana tx landed. Settles the pending
+    /// entry keyed by `sha256(message)` hex.
+    #[payable]
+    pub fn confirm_transfer(&mut self, message_hash: String, solana_sig: String) {
+        require!(env::attached_deposit() >= ONE_YOCTO, "attach 1 yoctoNEAR");
+        require!(
+            solana_sig.len() >= 64 && solana_sig.len() <= 128,
+            "solana_sig looks invalid"
+        );
+        let pending = self
+            .pending
+            .get(&message_hash)
+            .cloned()
+            .expect("unknown pending");
+        require!(!pending.settled, "pending already settled");
+        let watcher = self
+            .trusts
+            .get(&pending.trust_id)
+            .expect("unknown trust")
+            .watcher
+            .clone();
+        require!(
+            env::predecessor_account_id() == watcher,
+            "only the trusted watcher can confirm transfers"
+        );
+        self.settle_pending(&pending, &solana_sig);
+    }
+
+    /// Anyone may release an expired, unsettled pending so the balance can
+    /// be signed again (~90s, covering ~150 Solana slots).
+    pub fn release_pending(&mut self, message_hash: String) {
+        let pending = self
+            .pending
+            .get(&message_hash)
+            .cloned()
+            .expect("unknown pending");
+        require!(!pending.settled, "pending already settled");
+        require!(
+            env::block_timestamp() >= pending.expires_at_ns,
+            "pending has not expired"
+        );
+        self.clear_pending(&pending);
     }
 
     pub fn domain_id(&self) -> u64 {
@@ -533,15 +693,26 @@ impl Contract {
         &mut self,
         trust_id: u64,
         kind: String,
+        contributor: Option<String>,
         #[callback_result] result: Result<String, PromiseError>,
     ) -> Option<String> {
         match result {
             Ok(key) => {
-                if let Some(trust) = self.trusts.get_mut(&trust_id) {
-                    if kind == "raise" {
-                        trust.raise_address = Some(mpc::solana_address_from_near_key(&key));
-                    } else if kind == "fees" {
-                        trust.fee_address = Some(mpc::solana_address_from_near_key(&key));
+                let addr = mpc::solana_address_from_near_key(&key);
+                if kind == "raise" {
+                    if let Some(trust) = self.trusts.get_mut(&trust_id) {
+                        trust.raise_address = Some(addr);
+                    }
+                } else if kind == "fees" {
+                    if let Some(trust) = self.trusts.get_mut(&trust_id) {
+                        trust.fee_address = Some(addr);
+                    }
+                } else if kind == "in" {
+                    if let Some(pk) = contributor.as_ref() {
+                        let key_id = ledger_key(trust_id, pk);
+                        if let Some(row) = self.ledger.get_mut(&key_id) {
+                            row.deposit_address = Some(addr);
+                        }
                     }
                 }
                 env::log_str(&format!(
@@ -574,7 +745,10 @@ impl Contract {
                 Some(signature)
             }
             Err(_) => {
-                self.rollback_sign(trust_id, &action, &contributor, lamports);
+                if let Some(pending) = self.pending.get(&message_hash_hex).cloned() {
+                    self.clear_pending(&pending);
+                }
+                let _ = (action, contributor, lamports);
                 env::log_str("MPC signature request failed");
                 None
             }
@@ -598,6 +772,7 @@ impl Contract {
             overflow_lamports: 0,
             swept_lamports: 0,
             refunded_lamports: 0,
+            raise_refunded_lamports: 0,
             last_solana_sig: String::new(),
         };
         self.ledger.insert(key, row.clone());
@@ -642,11 +817,106 @@ impl Contract {
         bs58::decode_pubkey(addr).unwrap_or_else(|e| env::panic_str(e))
     }
 
-    fn optional_deposit_source(&self, trust_id: u64, contributor: &str) -> Option<[u8; 32]> {
-        self.ledger
+    fn require_deposit_source(&self, trust_id: u64, contributor: &str) -> [u8; 32] {
+        let row = self
+            .ledger
             .get(&ledger_key(trust_id, contributor))
-            .and_then(|row| row.deposit_address.as_ref())
-            .map(|addr| bs58::decode_pubkey(addr).unwrap_or_else(|e| env::panic_str(e)))
+            .expect("unknown contributor");
+        let addr = row
+            .deposit_address
+            .as_ref()
+            .expect("deposit address not derived");
+        bs58::decode_pubkey(addr).unwrap_or_else(|e| env::panic_str(e))
+    }
+
+    fn kick_derive(&self, trust_id: u64, kind: &str, contributor: Option<String>) -> Promise {
+        let path = if kind == "in" {
+            contributor_path(
+                trust_id,
+                contributor.as_deref().expect("contributor required for kind=in"),
+            )
+        } else {
+            derive_path(trust_id, kind)
+        };
+        derived_public_key_promise(self.mpc_contract.clone(), path, env::current_account_id()).then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(Gas::from_tgas(10))
+                .on_derived_public_key(trust_id, kind.to_string(), contributor),
+        )
+    }
+
+    fn pending_amount(&self, trust_id: u64, contributor: &str, kind: &str) -> u64 {
+        let Some(hash) = self.locks.get(&lock_key(trust_id, contributor, kind)) else {
+            return 0;
+        };
+        match self.pending.get(hash) {
+            Some(p) if !p.settled && env::block_timestamp() < p.expires_at_ns => p.lamports,
+            _ => 0,
+        }
+    }
+
+    fn lock_pending(
+        &mut self,
+        trust_id: u64,
+        contributor: &str,
+        kind: &str,
+        lamports: u64,
+        message: &[u8],
+    ) {
+        self.release_expired_lock(trust_id, contributor, kind);
+        require!(
+            self.pending_amount(trust_id, contributor, kind) == 0,
+            "transfer already pending"
+        );
+        let message_hash = hex::encode(env::sha256(message));
+        let pending = PendingTransfer {
+            trust_id,
+            contributor: contributor.to_string(),
+            kind: kind.to_string(),
+            lamports,
+            message_hash: message_hash.clone(),
+            expires_at_ns: env::block_timestamp().saturating_add(PENDING_EXPIRY_NS),
+            settled: false,
+        };
+        self.pending.insert(message_hash.clone(), pending);
+        self.locks
+            .insert(lock_key(trust_id, contributor, kind), message_hash);
+    }
+
+    fn release_expired_lock(&mut self, trust_id: u64, contributor: &str, kind: &str) {
+        let lk = lock_key(trust_id, contributor, kind);
+        let Some(hash) = self.locks.get(&lk).cloned() else {
+            return;
+        };
+        if let Some(p) = self.pending.get(&hash).cloned() {
+            if !p.settled && env::block_timestamp() >= p.expires_at_ns {
+                self.clear_pending(&p);
+            }
+        }
+    }
+
+    fn settle_pending(&mut self, pending: &PendingTransfer, solana_sig: &str) {
+        let key = ledger_key(pending.trust_id, &pending.contributor);
+        let row = self.ledger.get_mut(&key).expect("unknown contributor");
+        match pending.kind.as_str() {
+            "sweep" => row.swept_lamports = row.swept_lamports.saturating_add(pending.lamports),
+            "refund" => row.refunded_lamports = row.refunded_lamports.saturating_add(pending.lamports),
+            "raise_refund" => {
+                row.raise_refunded_lamports =
+                    row.raise_refunded_lamports.saturating_add(pending.lamports)
+            }
+            _ => env::panic_str("unknown pending kind"),
+        }
+        row.last_solana_sig = solana_sig.to_string();
+        self.clear_pending(pending);
+    }
+
+    fn clear_pending(&mut self, pending: &PendingTransfer) {
+        self.pending.remove(&pending.message_hash);
+        let lk = lock_key(pending.trust_id, &pending.contributor, &pending.kind);
+        if self.locks.get(&lk).map(|h| h == &pending.message_hash).unwrap_or(false) {
+            self.locks.remove(&lk);
+        }
     }
 
     fn check_transfer(
@@ -670,37 +940,9 @@ impl Contract {
         .unwrap_or_else(|e| env::panic_str(e.as_str()))
     }
 
-    fn book_sweep(&mut self, trust_id: u64, contributor: &str, lamports: u64) {
-        let key = ledger_key(trust_id, contributor);
-        let row = self.ledger.get_mut(&key).expect("unknown contributor");
-        row.swept_lamports = row.swept_lamports.saturating_add(lamports);
-        if let Some(trust) = self.trusts.get_mut(&trust_id) {
-            if trust.state == TrustState::Filled {
-                trust.state = TrustState::Executing;
-                trust.execution_started_ns = Some(env::block_timestamp());
-            }
-        }
-    }
-
-    fn book_refund(&mut self, trust_id: u64, contributor: &str, lamports: u64) {
-        let key = ledger_key(trust_id, contributor);
-        let row = self.ledger.get_mut(&key).expect("unknown contributor");
-        row.refunded_lamports = row.refunded_lamports.saturating_add(lamports);
-    }
-
-    fn rollback_sign(&mut self, trust_id: u64, action: &str, contributor: &str, lamports: u64) {
-        let key = ledger_key(trust_id, contributor);
-        if let Some(row) = self.ledger.get_mut(&key) {
-            if action == "sweep" {
-                row.swept_lamports = row.swept_lamports.saturating_sub(lamports);
-            } else if action == "refund" {
-                row.refunded_lamports = row.refunded_lamports.saturating_sub(lamports);
-            }
-        }
-    }
-
     fn sign_vault_tx(
         &self,
+        path: String,
         trust_id: u64,
         contributor: &str,
         action: &str,
@@ -709,7 +951,6 @@ impl Contract {
     ) -> Promise {
         let payload_hex = hex::encode(message);
         let message_hash_hex = hex::encode(env::sha256(message));
-        let path = contributor_path(trust_id, contributor);
         sign_eddsa_promise(self.mpc_contract.clone(), path, payload_hex).then(
             Self::ext(env::current_account_id())
                 .with_static_gas(MPC_CALLBACK_GAS)
@@ -735,9 +976,13 @@ mod tests {
     use near_sdk::testing_env;
 
     const DEMO_PUBKEY: &str = "B4paagQ87U6kmpn3AoXYaZMQVsFCJbZtjh8tBoKDDXwj";
+    const DEPOSIT_ADDR: &str = "F1aZA8xz3ueSpV5CQFB8PGz8y5QXZZtFdZJRTcZQ8DR6";
+    const RAISE_ADDR: &str = "B4paagQ87U6kmpn3AoXYaZMQVsFCJbZtjh8tBoKDDXwj";
+    const OTHER_VAULT: &str = "7bjnioap6J85RWuqPn2CEFRJSSMGvm6CGDR5SsxvxfLa";
     const SIG_A: &str = "32cEnng3NKyCv2VLQ47M2uXnVDp1LZH7B7rtWZtzHDP2QHz6yrEbFJw7kyWerMs1CYZ2vMoa3cgrcKmKkGNgbd9G";
     const SIG_B: &str = "2wBCwpDikerJ7WiYNu4pRGkyP2QTD5EvHg6mFgnvyw2Q291M72Lpj542ZXnAcxewghaGo14cEg6KHiRZKjtVTMza";
     const SIG_C: &str = "2UwjXHH8ochhUvGhnDx7pSYDwJWUBdsLkav6yEShNXjqWNqMafUTqvU8fu23QEUKWErME8bqY42cvQoU9XEPWr8A";
+    const SIG_D: &str = "452rHV4vsvxXjAYKXceyeQYmiavoLfAtBbj14kWi9Xdr6S6NCWbRtN9a6WsCi5NLprEiBSeBXdNLhVQKezo6pr9e";
 
     fn context(predecessor: AccountId, deposit: NearToken) -> VMContextBuilder {
         let mut b = VMContextBuilder::new();
@@ -765,7 +1010,7 @@ mod tests {
             cap_bps: Some(100),
             fill_fee_bps: Some(150),
             execution_timeout_ns: Some(1_000),
-            watcher: None,
+            watcher: accounts(2),
         }
     }
 
@@ -827,6 +1072,46 @@ mod tests {
         c.create_trust(fill_config(target, deadline_ns))
     }
 
+    fn seed_raise(c: &mut Contract, id: u64) {
+        let _ = c.on_derived_public_key(
+            id,
+            "raise".into(),
+            None,
+            Ok(format!("ed25519:{RAISE_ADDR}")),
+        );
+        let _ = c.on_derived_public_key(
+            id,
+            "fees".into(),
+            None,
+            Ok(format!("ed25519:{OTHER_VAULT}")),
+        );
+    }
+
+    fn seed_deposit(c: &mut Contract, id: u64) {
+        let _ = c.on_derived_public_key(
+            id,
+            "in".into(),
+            Some(DEMO_PUBKEY.into()),
+            Ok(format!("ed25519:{DEPOSIT_ADDR}")),
+        );
+    }
+
+    fn message_hash(bytes: &[u8]) -> String {
+        hex::encode(near_sdk::env::sha256(bytes))
+    }
+
+    fn deposit_bytes() -> [u8; 32] {
+        bs58::decode_pubkey(DEPOSIT_ADDR).unwrap()
+    }
+
+    fn raise_bytes() -> [u8; 32] {
+        bs58::decode_pubkey(RAISE_ADDR).unwrap()
+    }
+
+    fn owner_bytes() -> [u8; 32] {
+        bs58::decode_pubkey(DEMO_PUBKEY).unwrap()
+    }
+
     #[test]
     fn create_and_view_trust() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
@@ -863,9 +1148,15 @@ mod tests {
         testing_env!(context(accounts(2), ONE_YOCTO).build());
         let path = c.register(id, DEMO_PUBKEY.into());
         assert_eq!(path, format!("trust/1/in/{DEMO_PUBKEY}"));
+        seed_deposit(&mut c, id);
+        seed_raise(&mut c, id);
         let row = c.get_contribution(id, DEMO_PUBKEY.into()).unwrap();
         assert_eq!(row.deposit_path, path);
+        assert_eq!(row.deposit_address.as_deref(), Some(DEPOSIT_ADDR));
         assert_eq!(row.credited_lamports, 0);
+        let trust = c.get_trust(id).unwrap();
+        assert_eq!(trust.raise_address.as_deref(), Some(RAISE_ADDR));
+        assert_eq!(trust.fee_address.as_deref(), Some(OTHER_VAULT));
     }
 
     #[test]
@@ -919,11 +1210,11 @@ mod tests {
     }
 
     #[test]
-    fn watcher_is_enforced_when_set() {
+    fn watcher_is_required() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let mut cfg = demo_config(1_000, 9_000);
-        cfg.watcher = Some(accounts(3));
+        cfg.watcher = accounts(3);
         let id = c.create_trust(cfg);
         testing_env!(context(accounts(2), ONE_YOCTO).build());
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -956,10 +1247,9 @@ mod tests {
         let id = open_trust(&mut c, 1_000, 9_000);
         testing_env!(context(accounts(2), ONE_YOCTO).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
-        let owner = bs58::decode_pubkey(DEMO_PUBKEY).unwrap();
+        seed_deposit(&mut c, id);
         let attacker = [9u8; 32];
-        let bytes = transfer_bytes([1u8; 32], attacker, 10);
-        let _ = owner;
+        let bytes = transfer_bytes(deposit_bytes(), attacker, 10);
         testing_env!(context(accounts(1), ONE_YOCTO).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
@@ -972,8 +1262,9 @@ mod tests {
         let id = open_fillable(&mut c, 10, 9_000);
         testing_env!(context(accounts(2), ONE_YOCTO).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
-        let _ = c.on_derived_public_key(id, "raise".into(), Ok(format!("ed25519:{DEMO_PUBKEY}")));
-        let bytes = relayer_paid_bytes([8u8; 32], [1u8; 32], [9u8; 32], 10);
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), [9u8; 32], 10);
         testing_env!(context(accounts(1), ONE_YOCTO).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
@@ -985,19 +1276,28 @@ mod tests {
         let id = open_fillable(&mut c, 10, 9_000);
         testing_env!(context(accounts(2), ONE_YOCTO).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
-        let _ = c.on_derived_public_key(id, "raise".into(), Ok(format!("ed25519:{DEMO_PUBKEY}")));
-        let raise = bs58::decode_pubkey(DEMO_PUBKEY).unwrap();
-        let bytes = relayer_paid_bytes([8u8; 32], [1u8; 32], raise, 10);
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
         testing_env!(context(accounts(1), ONE_YOCTO).build());
-        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Executing);
+        assert_eq!(
+            c.get_contribution(id, DEMO_PUBKEY.into())
+                .unwrap()
+                .swept_lamports,
+            0
+        );
+        assert_eq!(c.sweepable(id, DEMO_PUBKEY.into()), 0);
+        let hash = message_hash(&bytes);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.confirm_transfer(hash, SIG_D.into());
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
                 .unwrap()
                 .swept_lamports,
             10
         );
-        assert_eq!(c.sweepable(id, DEMO_PUBKEY.into()), 0);
     }
 
     #[test]
@@ -1007,10 +1307,18 @@ mod tests {
         let id = open_trust(&mut c, 1_000, 9_000);
         testing_env!(context(accounts(2), ONE_YOCTO).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
-        let dest = bs58::decode_pubkey(DEMO_PUBKEY).unwrap();
-        let bytes = relayer_paid_bytes([8u8; 32], [1u8; 32], dest, 40);
+        seed_deposit(&mut c, id);
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 40);
         testing_env!(context(accounts(1), ONE_YOCTO).build());
-        let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
+        let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
+        assert_eq!(
+            c.get_contribution(id, DEMO_PUBKEY.into())
+                .unwrap()
+                .refunded_lamports,
+            0
+        );
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.confirm_transfer(message_hash(&bytes), SIG_D.into());
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
                 .unwrap()
@@ -1029,8 +1337,8 @@ mod tests {
         let id = open_trust(&mut c, 1_000, 9_000);
         testing_env!(context(accounts(2), ONE_YOCTO).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
-        let dest = bs58::decode_pubkey(DEMO_PUBKEY).unwrap();
-        let bytes = relayer_paid_bytes([8u8; 32], [1u8; 32], dest, 10);
+        seed_deposit(&mut c, id);
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 10);
         testing_env!(context(accounts(1), ONE_YOCTO).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
@@ -1047,6 +1355,7 @@ mod tests {
         assert_eq!(row.credited_lamports, 10);
         assert_eq!(row.overflow_lamports, 7);
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Filled);
+        assert_eq!(c.refundable(id, DEMO_PUBKEY.into()), 7);
     }
 
     #[test]
@@ -1056,24 +1365,159 @@ mod tests {
         let id = open_fillable(&mut c, 10, 9_000);
         testing_env!(context(accounts(2), ONE_YOCTO).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_C.into());
-        let _ = c.on_derived_public_key(id, "raise".into(), Ok(format!("ed25519:{DEMO_PUBKEY}")));
-        let raise = bs58::decode_pubkey(DEMO_PUBKEY).unwrap();
-        let bytes = relayer_paid_bytes([8u8; 32], [1u8; 32], raise, 10);
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
         testing_env!(context(accounts(1), ONE_YOCTO).build());
-        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
+        let hash = message_hash(&bytes);
+        assert!(c.get_pending(hash.clone()).is_some());
         let _ = c.on_signature_received(
             id,
             "sweep".into(),
             DEMO_PUBKEY.into(),
             10,
-            "ab".into(),
+            hash.clone(),
             Err(PromiseError::Failed),
         );
+        assert!(c.get_pending(hash).is_none());
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
                 .unwrap()
                 .swept_lamports,
             0
         );
+        assert_eq!(c.sweepable(id, DEMO_PUBKEY.into()), 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "deposit address not derived")]
+    fn request_refund_rejects_when_deposit_address_missing() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_trust(&mut c, 1_000, 9_000);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 40);
+        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
+    }
+
+    #[test]
+    #[should_panic(expected = "transfer source is not the derived deposit address")]
+    fn request_refund_rejects_fee_payer_as_source() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_trust(&mut c, 1_000, 9_000);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
+        seed_deposit(&mut c, id);
+        let fee_payer = [8u8; 32];
+        let bytes = relayer_paid_bytes(fee_payer, fee_payer, owner_bytes(), 40);
+        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
+    }
+
+    #[test]
+    #[should_panic(expected = "transfer source is not the derived deposit address")]
+    fn request_refund_rejects_other_contributor_vault() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_trust(&mut c, 1_000, 9_000);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
+        seed_deposit(&mut c, id);
+        let other = bs58::decode_pubkey(OTHER_VAULT).unwrap();
+        let bytes = relayer_paid_bytes([8u8; 32], other, owner_bytes(), 40);
+        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
+    }
+
+    #[test]
+    #[should_panic(expected = "transfer already pending")]
+    fn double_sign_is_blocked_while_pending() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 10, 9_000);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let first = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 6);
+        let second = relayer_paid_bytes([7u8; 32], deposit_bytes(), raise_bytes(), 4);
+        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(first));
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(second));
+    }
+
+    #[test]
+    fn expired_pending_can_be_released() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 10, 9_000);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
+        let hash = message_hash(&bytes);
+        testing_env!(context_at(
+            accounts(1),
+            NearToken::from_yoctonear(0),
+            1_000 + PENDING_EXPIRY_NS + 1
+        )
+        .build());
+        c.release_pending(hash.clone());
+        assert!(c.get_pending(hash).is_none());
+        assert_eq!(c.sweepable(id, DEMO_PUBKEY.into()), 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "pending has not expired")]
+    fn release_before_expiry_fails() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 10, 9_000);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
+        c.release_pending(message_hash(&bytes));
+    }
+
+    #[test]
+    fn request_raise_refund_from_raise_vault() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 10, 2_000);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let sweep = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(sweep.clone()));
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.confirm_transfer(message_hash(&sweep), SIG_B.into());
+        testing_env!(context_at(accounts(2), NearToken::from_yoctonear(0), 3_000).build());
+        assert_eq!(c.try_timeout(id), TrustState::Refunding);
+        assert_eq!(c.raise_refundable(id, DEMO_PUBKEY.into()), 10);
+        let refund = relayer_paid_bytes([8u8; 32], raise_bytes(), owner_bytes(), 10);
+        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        let _ = c.request_raise_refund(id, DEMO_PUBKEY.into(), Base64VecU8(refund.clone()));
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        c.confirm_transfer(message_hash(&refund), SIG_C.into());
+        assert_eq!(
+            c.get_contribution(id, DEMO_PUBKEY.into())
+                .unwrap()
+                .raise_refunded_lamports,
+            10
+        );
+        assert_eq!(c.raise_refundable(id, DEMO_PUBKEY.into()), 0);
     }
 }
