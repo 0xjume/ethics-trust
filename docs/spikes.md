@@ -182,16 +182,68 @@ A leftover-budget late confirm is rejected (`amount exceeds remaining budget`).
 
 Account: [m5.keyless-trust-dev-54ef71.testnet](https://testnet.nearblocks.io/address/m5.keyless-trust-dev-54ef71.testnet).
 
+### Milestone 3 deploy recipe (m6)
+
+Borsh added mint/pool/fill-fee fields. Deploy a **new** subaccount; do not
+reuse m5. Human-run on testnet + Solana **devnet** (this agent does not
+deploy or spend).
+
+```bash
+scripts/build-wasm.sh
+NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
+NEAR_PRIVATE_KEY=ed25519:... \
+DEPLOY_SUBACCOUNT=m6 \
+EXECUTE_DEPLOY=1 \
+pnpm deploy-testnet
+# → m6.keyless-trust-dev-54ef71.testnet  (waitUntil FINAL, no full-access key)
+
+export CONTRACT_ID=m6.keyless-trust-dev-54ef71.testnet
+export NEAR_PREDECESSOR=$CONTRACT_ID
+export TRUST_ID=1
+
+# 1. Derive raise / fees / mint (predecessor = the new contract).
+pnpm derive-addresses
+
+# 2. createConfig2 on Solana devnet: feeClaimer=fees, leftoverReceiver=raise.
+EXECUTE_CREATE_CONFIG=1 pnpm create-dbc-config
+# copy config pubkey → DBC_CONFIG
+
+# 3. create_trust({ dbc_config: $DBC_CONFIG, name, symbol, uri, watcher, target_lamports, deadline_ns })
+#    Wait for derived raise/fees/mint addresses (or request_derived_key kind=mint).
+
+# 4. Register, report_deposit, request_sweep, confirm_transfer until
+#    swept_total == credited_total and state == Executing.
+
+# 5. Build the launch message (fill fee in-tx unless FILL_FEE_ALREADY_PAID=1).
+CREDITED_LAMPORTS=<credited_total> DBC_CONFIG=<pubkey> \
+  pnpm build-launch-message
+# copy messageBase64 / messageHash
+
+# 6. Two MPC signs. Attach 90 TGas + 0.01 NEAR.
+EXECUTE_REQUEST_LAUNCH=1 LAUNCH_MESSAGE_B64=... pnpm request-launch
+
+# 7. Relayer co-signs and submits (3 signatures: relayer + raise + mint).
+RAISE_SIGNATURE=... MINT_SIGNATURE=... \
+RAISE_ADDRESS=... MINT_ADDRESS=... \
+SOLANA_SUBMIT=1 pnpm relay-launch
+
+# 8. Watcher confirms → Launched; pool_address and fill_fee_paid recorded.
+EXECUTE_CONFIRM_LAUNCH=1 LAUNCH_MESSAGE_HASH=... SOLANA_SIG=... \
+  pnpm confirm-launch
+```
+
+`request_distribute` is Milestone 4 and panics.
+
 ### Deploy script
 
 ```bash
 scripts/build-wasm.sh
 NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
 NEAR_PRIVATE_KEY=ed25519:... \
-DEPLOY_SUBACCOUNT=m5 \
+DEPLOY_SUBACCOUNT=m6 \
 EXECUTE_DEPLOY=1 \
 pnpm deploy-testnet
-# → m5.keyless-trust-dev-54ef71.testnet
+# → m6.keyless-trust-dev-54ef71.testnet
 # wrapper: scripts/deploy-testnet.sh
 # DEPLOY_NEAR overrides the computed floor (5.5)
 # DEPLOY_KEEP_KEY=1 leaves a full-access key (off by default)

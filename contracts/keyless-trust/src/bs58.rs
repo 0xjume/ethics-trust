@@ -41,7 +41,6 @@ pub fn decode_pubkey(input: &str) -> Result<[u8; 32], &'static str> {
         .map_err(|_| "solana pubkey must decode to 32 bytes")
 }
 
-#[cfg(test)]
 pub fn encode(data: &[u8]) -> String {
     if data.is_empty() {
         return String::new();

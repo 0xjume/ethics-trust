@@ -1,6 +1,6 @@
 # Keyless Trust: build plan (NEAR HACKATHON, track `memecoins`)
 
-Status: research plan plus day-1 scaffold and milestone-2 chip-in / refund / sweep. No funded accounts or spend in the agent env; deploy script is documented. SDK pins and spike numbers: `docs/DECISIONS.md`, `docs/spikes.md`.
+Status: research plan plus day-1 scaffold, milestone-2 chip-in / refund / sweep, and milestone-3 DBC Shape C launch. No funded accounts or spend in the agent env; deploy script is documented. SDK pins and spike numbers: `docs/DECISIONS.md`, `docs/spikes.md`.
 Prepared 3 Nov 2026 (WIB). Scope chosen by Jume: Track A only, a separate hackathon entry, testnet and devnet only, submitted before 15 Nov 2026 06:59 WIB.
 
 > One line: community token raises on Solana where no person or server holds the vaults. A NEAR contract controls every vault through Chain Signatures and will only ever sign five transaction shapes: refund, capped sweep, Meteora DBC create-and-buy, pro-rata distribution, and (stretch) the 70/20/10 fee split.
@@ -61,7 +61,7 @@ Sources: [HACKATHON.md](https://nearhackathon.com/HACKATHON.md), [nearhackathon.
                        Meteora DBC pool (config pinned at create_trust) ──► DAMM v2 on graduation
                                │ creator trading fees
                                ▼
-                         fee vault  ◄── path "trust/<id>/fees"  (DBC pool creator)
+                         fee vault  ◄── path "trust/<id>/fees"  (feeClaimer + 1.5% fill fee)
                                │ (stretch) 70/20/10 split only
 
  NEAR testnet:  keyless-trust contract ──sign(payload_v2:{Eddsa}, path, domain_id:1)──► v1.signer-prod.testnet
@@ -82,11 +82,12 @@ No admin key: the contract is deployed, initialised with `mpc_contract`, `dbc_pr
 
 - Chain Signatures derives a child key from the MPC root key, the **predecessor account** (the Trust contract) and a path string. For Ed25519 (domain 1) the derived public key *is* the Solana address (base58).
 - Paths (fixed by the contract; callers cannot choose them):
-  - `trust/<id>/raise` — raise vault (payer + buyer of the DBC first buy, holds bought tokens until distribution)
-  - `trust/<id>/fees` — fee vault (DBC `creator`, receives creator trading fees)
+  - `trust/<id>/raise` — raise vault (payer + buyer + DBC `poolCreator` of the first buy, leftover receiver)
+  - `trust/<id>/fees` — fee vault (`feeClaimer`, receives the 1.5% fill fee and later creator trading fees)
+  - `trust/<id>/mint` — deterministic base mint (MPC-signed; no throwaway keypair)
   - `trust/<id>/in/<contributor_solana_pubkey_base58>` — one deposit address per contributor
 - Verified 3 Nov 2026 on testnet: `v1.signer-prod.testnet.derived_public_key({"path":"trust/1/raise","predecessor":"example.testnet","domain_id":1})` returns `"ed25519:B4paagQ87U6kmpn3AoXYaZMQVsFCJbZtjh8tBoKDDXwj"`. Mainnet signer: `v1.signer` (not used in this entry).
-- **How the contract learns addresses without curve math in WASM**: `create_trust` and `register` make a cross-contract call to `derived_public_key` with `predecessor = env::current_account_id()` and store the result in the callback. No one supplies addresses, so a relayer cannot substitute one. (Alternative: compute the Ed25519 tweak in-contract with curve25519-dalek; skip unless the cross-contract call is a problem.)
+- **How the contract learns addresses without curve math in WASM**: `create_trust` and `register` make a cross-contract call to `derived_public_key` with `predecessor = env::current_account_id()` and store the result in the callback (`raise`, `fees`, and `mint`). No one supplies addresses, so a relayer cannot substitute one. (Alternative: compute the Ed25519 tweak in-contract with curve25519-dalek; skip unless the cross-contract call is a problem.)
 - **Registration**: `register(trust_id, solana_pubkey)` is permissionless. It is safe for anyone to register any pubkey, because the deposit address is derived from that pubkey and refunds can only ever go to it. Optional anti-spam: require a Solana `signMessage` over `keyless-trust:<contract>:<trust_id>:<pubkey>` checked with `env::ed25519_verify`. The MVP leaves this out (cheaper, and keeps the design independent from Sana Guard).
 
 ## 3. Signing pipeline and on-chain checks
@@ -121,13 +122,15 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 - Overpayment never enters the raise: the remainder goes back in the same tx.
 - Allowed only in state `Executing`.
 
-### 3.4 Shape C — DBC create-and-buy (raise vault, fee vault)
-- Built by `DynamicBondingCurveClient.creator.createPoolWithFirstBuy` (SDK 2.0.0 ↔ program 0.2.2), then decompiled to a message. Expected instructions: `initialize_virtual_pool_with_spl_token` (discriminator `[140,85,215,176,102,54,104,79]`), wSOL prep (ATA create-idempotent, System transfer, `SyncNative`), output ATA create-idempotent, `swap` (`[248,198,158,145,225,117,135,200]`, args `amount_in u64, minimum_amount_out u64`) or `swap2`.
-- Checks: program id = DBC; `config` = the pubkey pinned in the Trust; `pool_authority` = `FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM`; `creator` = fee vault; `payer` = raise vault; `quote_mint` = wSOL (or the pinned quote mint); `token_program` = Tokenkeg (classic SPL only, no Token-2022 base); `name/symbol/uri` = the strings fixed at `create_trust` (hash compared); swap `payer` = raise vault, `input_token_account`/`output_token_account` = raise vault's ATAs (checked via the create-idempotent instructions whose `owner` = raise vault — the ATA program enforces the derivation on Solana, so NEAR does no PDA maths); `amount_in = Σ swept − fill_fee − reserved_sol_for_fees`; `minimum_amount_out ≥` a floor computed off-chain and committed in `request_execute` (judged-safe default: 1, since the first buy into a fresh pool cannot be front-run inside the same tx).
+### 3.4 Shape C — DBC create-and-buy (raise vault + mint)
+- Built by `DynamicBondingCurveClient.creator.createPoolWithFirstBuy` (SDK 2.0.0 ↔ program 0.2.2), then decompiled to a message. Expected instructions: optional System transfer of the 1.5% fill fee (raise → fee vault), `initialize_virtual_pool_with_spl_token` (discriminator `[140,85,215,176,102,54,104,79]`), wSOL prep (ATA create-idempotent, System transfer, `SyncNative`), output ATA create-idempotent, `swap` (`[248,198,158,145,225,117,135,200]`, args `amount_in u64, minimum_amount_out u64`) or `swap2`.
+- Checks: program id = DBC; `config` = the pubkey pinned in the Trust (`dbc_config`, 32-byte base58); `pool_authority` = `FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM`; `creator` = **raise vault**; `payer` = raise vault; `quote_mint` = wSOL; `token_program` = Tokenkeg (classic SPL only, no Token-2022 base); `name/symbol/uri` = the strings fixed at `create_trust`; swap `payer` = raise vault, `input_token_account`/`output_token_account` = raise vault's ATAs (checked via the create-idempotent instructions whose `owner` = raise vault); `amount_in = credited_total − fill_fee`; `minimum_amount_out ≥ 1`.
 - PDAs (`pool`, `base_vault`, `quote_vault`, `mint_metadata`) are **not** recomputed on NEAR: the DBC program re-derives and rejects wrong ones.
-- `base_mint` must be a signer. Use a **relayer-generated throwaway keypair** (it only authorises creating the mint account at that address; DBC sets the mint authority to the pool authority). The contract checks base_mint is a signer that is not any Trust vault and not the fee payer. Result: 2 MPC signatures (raise vault, fee vault) + 1 relayer signature on one message.
+- `base_mint` must be a signer. It is the MPC-derived key at `trust/<id>/mint` (no random keypair). The contract signs the same message twice (`Promise::and` of raise + mint, ~90 TGas attached). Relayer is the Solana fee payer. Result: 2 MPC signatures + 1 relayer signature on one message.
+- Fill fee: exact 1.5% raise → fee vault, either in this tx or a prior `request_fill_fee` shape.
 - Double execution: a second landing fails because the pool PDA already exists.
 - Allowed only in `Executing` after all sweeps are reported landed.
+- `request_distribute` is a Milestone 4 stub.
 
 ### 3.5 Shape D — Pro-rata distribution (raise vault → contributors)
 - Signer: raise vault. Repeated pairs: `ATA::CreateIdempotent(payer=raise, ata, owner=<pubkey>, mint=base_mint)` + `Token::Transfer(raise_ata → ata, amount)`, up to ~5 recipients per tx (size budget).
@@ -143,7 +146,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 - **Watcher/relayer**: NEAR cannot read Solana. A watcher **must** be set at `create_trust`. It reports deposit balances, confirms landed sweeps/refunds (`confirm_transfer`), and the post-buy token amount. A lying or offline watcher can **delay** everything and can **skew the pro-rata split among real registered contributors** (e.g. understate one sweep), but cannot send funds to any address the contract did not derive (owner, raise vault, DBC pool, contributors, fixed fee destinations). Anyone can run a second watcher to audit. Refunds after the deadline are permissionless except that `confirm_transfer` still needs the named watcher.
 - Mitigations: multiple watchers with "first to report, others can dispute within N minutes" (stretch); every report is logged on NEAR so anyone can audit against Solana explorers; optional future: Solana light-client or ZK proofs of account state.
 - **Sybil**: the 1% cap is per *wallet*; one person can split into many wallets. Good enough for a demo, not a fairness guarantee. Say so.
-- **DBC config**: created once by a normal keypair with `createConfig2`; once created it cannot be changed, and the Trust pins its pubkey. `feeClaimer` and `leftoverReceiver` are set to the fee vault so no human receives partner fees.
+- **DBC config**: created once by a normal keypair with `createConfig2`; once created it cannot be changed, and the Trust pins its pubkey. `feeClaimer` = fee vault; `leftoverReceiver` = **raise vault**. No human receives partner fees.
 
 ## 5. Raise state machine
 
@@ -159,7 +162,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
    │             │ first sweep
    │             ▼
    │         Executing ──(24 h from start, not Launched)───────────► Refunding
-   │             │  sweeps (B) → create-and-buy (C)   [next milestone]
+   │             │  sweeps (B) → create-and-buy (C)   [this milestone]
    │             ▼
    │          Launched ──► pro-rata (D) ── (stretch) fee split (E)
 ```
@@ -170,7 +173,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 ## 6. Meteora DBC details
 
 - Program `dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN` (same id on mainnet and devnet, per Meteora docs). DAMM v2 `cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG`. SDK `@meteora-ag/dynamic-bonding-curve-sdk@2.0.0` (client) and `/math` (curve, fee, swap quote) — confirmed the 2.0.0 tarball embeds the IDL with the discriminators above.
-- Demo config (devnet, SOL quote; the NEAR-quoted Ethics curve with 609 NEAR initial / 5,483 NEAR migration cap only exists on mainnet, so scale it): fixed 1B supply, classic SPL (`tokenType` SPL), `transferFeeParameters: null`, migration to DAMM v2, LP locked, curve built with the SDK builder so that a ~2 SOL raise buys a meaningful slice and graduation happens at e.g. 10 SOL (or set the raise ≥ migration threshold to demo graduation). `enableFirstSwapWithMinFee` on, so the Trust's first buy pays the minimum fee (check semantic on day 1). `feeClaimer` / `leftoverReceiver` = fee vault.
+- Demo config (devnet, SOL quote; the NEAR-quoted Ethics curve with 609 NEAR initial / 5,483 NEAR migration cap only exists on mainnet, so scale it): fixed 1B supply, classic SPL (`tokenType` SPL), `transferFeeParameters: null`, migration to DAMM v2, LP locked, curve built with the SDK builder so that a ~2 SOL raise buys a meaningful slice and graduation happens at e.g. 10 SOL (or set the raise ≥ migration threshold to demo graduation). `enableFirstSwapWithMinFee` on, so the Trust's first buy pays the minimum fee (check semantic on day 1). `feeClaimer` = fee vault; `leftoverReceiver` = raise vault.
 - Only `createPoolWithFirstBuy` is used (never `createConfigAndPoolWithFirstBuy`, which returns two txs and would need the config key in the Trust's signing set).
 
 ## 7. Open technical risks

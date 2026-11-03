@@ -60,9 +60,9 @@ relayer paid the fee; the vault balance dropped by exactly 1 000 000 lamport
    **devnet** transfer from the keyless vault, with the relayer as fee payer.
 5. **Do** `pnpm deposit-address`. **See** `trust/1/in/<pubkey>` plus the
    `v1.signer-prod.testnet` derived Solana address (domain 1).
-6. **Do** (later, DBC launch) two wallets chip in, one overpays, execute.
-   **See** capped sweeps, a DBC pool on devnet, pro-rata tokens. A second Trust
-   that misses its deadline refunds to contributors.
+6. **Do** (m6, human live) `pnpm create-dbc-config` then `request_launch`
+   after the sweep settles. **See** a DBC pool on Solana **devnet**,
+   `state = Launched`, `pool_address` set. Pro-rata tokens are Milestone 4.
 
 ## NEAR tech used
 

@@ -78,6 +78,7 @@ mod tests {
     fn paths_match_plan() {
         assert_eq!(derive_path(1, "raise"), "trust/1/raise");
         assert_eq!(derive_path(1, "fees"), "trust/1/fees");
+        assert_eq!(derive_path(1, "mint"), "trust/1/mint");
         assert_eq!(
             contributor_path(1, "Abc123"),
             "trust/1/in/Abc123"

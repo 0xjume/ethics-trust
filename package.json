@@ -12,6 +12,11 @@
     "deploy-testnet": "pnpm --filter @keyless-trust/relayer deploy-testnet",
     "dbc-tx-size": "pnpm --filter @keyless-trust/relayer dbc-tx-size",
     "verify-dbc-sdk": "pnpm --filter @keyless-trust/relayer verify-dbc-sdk",
+    "create-dbc-config": "pnpm --filter @keyless-trust/relayer create-dbc-config",
+    "build-launch-message": "pnpm --filter @keyless-trust/relayer build-launch-message",
+    "request-launch": "pnpm --filter @keyless-trust/relayer request-launch",
+    "relay-launch": "pnpm --filter @keyless-trust/relayer relay-launch",
+    "confirm-launch": "pnpm --filter @keyless-trust/relayer confirm-launch",
     "dev:app": "pnpm --filter @keyless-trust/app dev"
   }
 }
