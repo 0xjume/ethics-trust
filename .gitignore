@@ -1,0 +1,40 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Node
+node_modules
+dist
+build
+.next
+.turbo
+.pnpm-store
+*.tsbuildinfo
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+keypair.json
+id.json
+neardev/
+.near-credentials/
+
+# Netlify / deploy
+.netlify
+
+# OS / editor
+.DS_Store
+.idea
+.vscode
+*.swp
+
+# Coverage / logs
+coverage
+*.log
+
+# Local sandbox downloads
+.near-sandbox
