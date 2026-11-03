@@ -1,0 +1,17 @@
+[package]
+name = "keyless-trust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "NEAR contract that owns Solana Trust vaults through Chain Signatures"
+repository = "https://github.com/0xjume/ethics-trust"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "=5.17.0"
+hex = "0.4"
+
+[dev-dependencies]
+near-sdk = { version = "=5.17.0", features = ["unit-testing"] }

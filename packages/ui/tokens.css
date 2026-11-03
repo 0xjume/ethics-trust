@@ -1,0 +1,151 @@
+/* Ethics Launch tokens, re-implemented for Keyless Trust. Source: ethics.ltd site.css / brief.md */
+
+:root {
+  --ethics-night: #0b0d0f;
+  --ethics-graphite: #12161a;
+  --ethics-pine: #16211d;
+  --ethics-slate: #2a3138;
+  --ethics-fog: #a7b0b7;
+  --ethics-silver: #d9dee3;
+  --ethics-jade: #63d6b4;
+  --ethics-teal: #38bfa7;
+  --ethics-violet: #7f7bff;
+  --ethics-rose: #f23674;
+
+  --background: var(--ethics-night);
+  --foreground: var(--ethics-silver);
+  --accent: var(--ethics-teal);
+  --accent-hover: var(--ethics-jade);
+  --panel: rgba(18, 22, 26, 0.8);
+  --border: rgba(42, 49, 56, 0.8);
+
+  --font-display: "Cormorant Garamond", Georgia, serif;
+  --font-sans: "DM Sans", system-ui, sans-serif;
+
+  --text-xxs: 0.5rem;
+  --text-label: 0.65rem;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 1.875rem;
+  --text-4xl: 2.25rem;
+  --text-6xl: 3.75rem;
+
+  --tracking-label: 0.18em;
+  --leading-tight: 1.15;
+  --leading-relaxed: 1.625;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1rem;
+  --radius-full: 9999px;
+
+  --max-width: 80rem;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-display {
+  font-family: var(--font-display);
+  font-weight: 500;
+}
+
+.ethics-grid-bg {
+  background-color: var(--ethics-night);
+  background-image:
+    linear-gradient(rgba(56, 191, 167, 0.04) 1px, transparent 0),
+    linear-gradient(90deg, rgba(56, 191, 167, 0.04) 1px, transparent 0),
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(22, 33, 29, 0.9), transparent),
+    radial-gradient(ellipse 60% 40% at 80% 20%, rgba(56, 191, 167, 0.06), transparent);
+  background-size: 48px 48px, 48px 48px, 100% 100%, 100% 100%;
+}
+
+.ethics-panel {
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.ethics-label {
+  margin: 0;
+  font-size: var(--text-label);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--ethics-teal);
+}
+
+.ethics-btn {
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--ethics-teal);
+  color: var(--ethics-night);
+  padding: 0.625rem 1.25rem;
+  font: 500 var(--text-sm) / 1.25 var(--font-sans);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.ethics-btn:hover {
+  background: var(--ethics-jade);
+}
+
+.ethics-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--ethics-slate);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ethics-silver);
+  padding: 0.625rem 1.25rem;
+  font: 500 var(--text-sm) / 1.25 var(--font-sans);
+  text-decoration: none;
+}
+
+.ethics-btn-ghost:hover {
+  border-color: rgba(56, 191, 167, 0.4);
+}
+
+.ethics-sparkle {
+  display: inline-block;
+  width: 0.7em;
+  height: 0.7em;
+  color: var(--ethics-teal);
+  transform: translateY(-0.15em);
+}
+
+.ethics-steps {
+  display: grid;
+  gap: var(--space-4);
+}
+
+@media (min-width: 768px) {
+  .ethics-steps {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

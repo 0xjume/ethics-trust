@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Keyless Trust</title>
+    <meta
+      name="description"
+      content="Community token raises whose Solana vaults no person or server holds."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600&family=DM+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <script type="module" src="./src/main.js"></script>
+  </head>
+  <body class="ethics-grid-bg">
+    <header class="kt-header">
+      <a class="kt-wordmark" href="/">
+        <span class="font-display">Keyless Trust</span>
+        <svg class="ethics-sparkle" viewBox="0 0 28 28" fill="currentColor" aria-hidden="true">
+          <path d="M14 0 L16.2 11.8 L28 14 L16.2 16.2 L14 28 L11.8 16.2 L0 14 L11.8 11.8 Z" />
+        </svg>
+      </a>
+      <span class="ethics-label">NEAR HACKATHON · memecoins · devnet</span>
+    </header>
+
+    <main class="kt-main">
+      <section class="ethics-panel kt-hero">
+        <p class="ethics-label">Keyless Trust</p>
+        <h1 class="font-display kt-title">
+          Raise a launch together. No one holds the vaults.
+        </h1>
+        <p class="kt-lead">
+          Chip in toward a target. A NEAR contract owns every Solana address and
+          will only sign refunds, capped sweeps, a Meteora DBC create-and-buy,
+          and pro-rata distribution.
+        </p>
+        <div class="kt-actions">
+          <a class="ethics-btn" href="#how">How it works</a>
+          <a class="ethics-btn-ghost" href="../README.md">Read the README</a>
+        </div>
+      </section>
+
+      <section id="how" class="kt-how">
+        <p class="ethics-label">How it works</p>
+        <h2 class="font-display kt-subtitle">Three steps. Keys stay on NEAR.</h2>
+        <div class="ethics-steps">
+          <article class="ethics-panel kt-step">
+            <p class="ethics-label">01</p>
+            <h3 class="font-display">Back the raise</h3>
+            <p>
+              Send SOL to your own derived deposit address. Up to 1% per wallet.
+              Miss the deadline and the contract will only sign a refund to you.
+            </p>
+          </article>
+          <article class="ethics-panel kt-step">
+            <p class="ethics-label">02</p>
+            <h3 class="font-display">The contract launches it</h3>
+            <p>
+              At the target, anyone can relay a Meteora DBC create-and-buy. The
+              raise vault and fee vault sign; no server key can change the
+              destination.
+            </p>
+          </article>
+          <article class="ethics-panel kt-step">
+            <p class="ethics-label">03</p>
+            <h3 class="font-display">Holders get the tokens</h3>
+            <p>
+              Tokens bought by the raise vault are paid out pro-rata. A later
+              stretch splits creator fees 70 / 20 / 10 to fixed addresses.
+            </p>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
