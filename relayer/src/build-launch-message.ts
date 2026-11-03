@@ -16,10 +16,11 @@
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { ASSOCIATED_TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { ASSOCIATED_TOKEN_PROGRAM_ID, NATIVE_MINT } from "@solana/spl-token";
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import BN from "bn.js";
+import { demoCurveConfig } from "./dbc-curve.ts";
 import { deriveTrustAddresses } from "./derive-addresses.ts";
 import { firstBuyLamports, fillFeeLamports, pinParamsHash } from "./launch-math.ts";
 import { PACKET_LIMIT } from "./dbc-tx-size.ts";
@@ -82,6 +83,68 @@ export function retargetAtaPayer(
   return tx;
 }
 
+export function finalizeLaunchMessage(
+  poolTx: Transaction,
+  raise: PublicKey,
+  feeVault: PublicKey,
+  relayer: PublicKey,
+  fillFee: number,
+  blockhash: string,
+): Buffer {
+  retargetAtaPayer(poolTx, raise, relayer);
+  let tx = fillFee > 0 ? prependFillFee(poolTx, raise, feeVault, fillFee) : poolTx;
+  tx.feePayer = relayer;
+  tx.recentBlockhash = blockhash;
+  const message = tx.serializeMessage();
+  if (message.length > PACKET_LIMIT) {
+    throw new Error(`launch message ${message.length} B exceeds ${PACKET_LIMIT}`);
+  }
+  if (message[0] & 0x80) {
+    throw new Error("versioned / ALT message is not allowed");
+  }
+  return Buffer.from(message);
+}
+
+/** Same SDK path as createPoolWithFirstBuy, but builds config+pool locally (no live config). */
+export async function buildSdkLaunchTransaction(args: {
+  connection: Connection;
+  relayer: PublicKey;
+  raise: PublicKey;
+  feeVault: PublicKey;
+  mint: PublicKey;
+  config: PublicKey;
+  name: string;
+  symbol: string;
+  uri: string;
+  buyLamports: bigint;
+}): Promise<Transaction> {
+  const client = new DynamicBondingCurveClient(args.connection, "confirmed");
+  const curve = demoCurveConfig();
+  const combo = await client.partner.createConfigAndPoolWithFirstBuy({
+    payer: args.relayer,
+    config: args.config,
+    feeClaimer: args.feeVault,
+    leftoverReceiver: args.raise,
+    quoteMint: NATIVE_MINT,
+    transferFeeParameters: null,
+    ...curve,
+    preCreatePoolParam: {
+      baseMint: args.mint,
+      name: args.name,
+      symbol: args.symbol,
+      uri: args.uri,
+      poolCreator: args.raise,
+    },
+    firstBuyParam: {
+      buyer: args.raise,
+      buyAmount: new BN(args.buyLamports.toString()),
+      minimumAmountOut: new BN(1),
+      referralTokenAccount: null,
+    },
+  });
+  return combo.createPoolWithFirstBuyTx;
+}
+
 export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
   const predecessor =
     process.env.CONTRACT_ID ?? process.env.NEAR_PREDECESSOR ?? "example.testnet";
@@ -139,20 +202,14 @@ export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
       referralTokenAccount: null,
     },
   });
-  retargetAtaPayer(poolTx, raise, relayer.publicKey);
-  if (!alreadyPaid && fee > 0n) {
-    poolTx = prependFillFee(poolTx, raise, fees, Number(fee));
-  }
-  poolTx.feePayer = relayer.publicKey;
-  poolTx.recentBlockhash = blockhash;
-
-  const message = poolTx.serializeMessage();
-  if (message.length > PACKET_LIMIT) {
-    throw new Error(`launch message ${message.length} B exceeds ${PACKET_LIMIT}`);
-  }
-  if (message[0] & 0x80) {
-    throw new Error("versioned / ALT message is not allowed");
-  }
+  const message = finalizeLaunchMessage(
+    poolTx,
+    raise,
+    fees,
+    relayer.publicKey,
+    alreadyPaid ? 0 : Number(fee),
+    blockhash,
+  );
 
   return {
     trustId,

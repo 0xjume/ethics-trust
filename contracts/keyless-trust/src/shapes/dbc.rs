@@ -2,8 +2,11 @@
 //!
 //! Every account on initialize, swap, ATA-create, SyncNative and the
 //! allowed System transfers is pinned (derived PDAs / ATAs compared by
-//! index). Relayer may pay init + ATA rent. Raise vault may wrap buy
-//! lamports into its WSOL ATA and optionally close that ATA back to itself.
+//! index). Relayer must pay init + ATA rent (never raise / mint / fee).
+//! Raise vault may wrap buy lamports into its WSOL ATA and optionally
+//! close that ATA back to itself. Swap is the IDL 15-account list
+//! (referral `None` = DBC program id at index 12) plus optional
+//! `Sysvar1nstructions`. ExactIn only; `minimum_amount_out ≥ 1`.
 
 use crate::bs58;
 use crate::pda::{find_program_address, ordered_keys};
@@ -66,9 +69,15 @@ const TOKEN_CLOSE_ACCOUNT: u8 = 9;
 const ATA_CREATE_IDEMPOTENT: u8 = 1;
 
 const INIT_ACCOUNTS: usize = 16;
-const SWAP_ACCOUNTS: usize = 14;
+/// IDL `swap` / `swap2`: 15 declared accounts. Index 12 is optional
+/// `referral_token_account` — Anchor encodes `None` as the DBC program id.
+/// A 16th remaining account may be `Sysvar1nstructions`.
+const SWAP_ACCOUNTS: usize = 15;
 const ATA_ACCOUNTS: usize = 6;
 const CLOSE_ACCOUNTS: usize = 3;
+const SWAP_IX_LEN: usize = 24;
+const SWAP2_IX_LEN: usize = 25;
+const SWAP_MODE_EXACT_IN: u8 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchCheck {
@@ -221,17 +230,47 @@ fn parse_init(data: &[u8]) -> Result<(String, String, String), ShapeError> {
     Ok((name, symbol, uri))
 }
 
+/// `swap` = disc + `{amount_in: u64, minimum_amount_out: u64}` (exactly 24).
+/// `swap2` = disc + `{amount_0, amount_1, swap_mode: u8}` (exactly 25).
+/// Builder uses ExactIn (`swap_mode = 0`) with `amount_in = credited − fee`
+/// and `minimum_amount_out ≥ 1` (nonzero floor; no on-chain quote, so this is
+/// the slippage bound). Extra trailing bytes are rejected.
 fn parse_swap_amounts(data: &[u8]) -> Result<(u64, u64), ShapeError> {
-    if data.len() < 24 {
+    if data.len() < 8 {
         return Err(ShapeError::WrongBuyAmount);
     }
     let disc = &data[0..8];
-    if disc != SWAP_DISC && disc != SWAP2_DISC {
+    if disc == SWAP_DISC {
+        if data.len() != SWAP_IX_LEN {
+            return Err(ShapeError::WrongParams);
+        }
+    } else if disc == SWAP2_DISC {
+        if data.len() != SWAP2_IX_LEN {
+            return Err(ShapeError::WrongParams);
+        }
+        if data[24] != SWAP_MODE_EXACT_IN {
+            return Err(ShapeError::WrongBuyAmount);
+        }
+    } else {
         return Err(ShapeError::MissingLaunchIx);
     }
     let amount_in = u64::from_le_bytes(data[8..16].try_into().unwrap());
     let min_out = u64::from_le_bytes(data[16..24].try_into().unwrap());
     Ok((amount_in, min_out))
+}
+
+fn require_relayer_payer(
+    payer: &[u8; 32],
+    relayer: &[u8; 32],
+    check: &LaunchCheck,
+) -> Result<(), ShapeError> {
+    if payer != relayer {
+        return Err(ShapeError::WrongSource);
+    }
+    if relayer == &check.raise || relayer == &check.mint || relayer == &check.fee {
+        return Err(ShapeError::WrongSource);
+    }
+    Ok(())
 }
 
 fn fee_payer(msg: &LegacyMessage) -> Result<[u8; 32], ShapeError> {
@@ -324,9 +363,7 @@ pub fn validate_launch(msg: &LegacyMessage, check: &LaunchCheck) -> Result<Valid
             if owner != check.raise {
                 return Err(ShapeError::WrongSource);
             }
-            if payer != check.raise && payer != relayer {
-                return Err(ShapeError::WrongSource);
-            }
+            require_relayer_payer(&payer, &relayer, check)?;
             if mint == WSOL_MINT {
                 if ata != derived.wsol_ata {
                     return Err(ShapeError::WrongAccount);
@@ -398,9 +435,7 @@ pub fn validate_launch(msg: &LegacyMessage, check: &LaunchCheck) -> Result<Valid
             require_acc(msg, &ix.accounts, 8, &derived.metadata)?;
             require_acc(msg, &ix.accounts, 9, &METADATA_PROGRAM)?;
             let payer = *acc(msg, &ix.accounts, 10)?;
-            if payer != check.raise && payer != relayer {
-                return Err(ShapeError::WrongSource);
-            }
+            require_relayer_payer(&payer, &relayer, check)?;
             require_acc(msg, &ix.accounts, 11, &TOKEN_PROGRAM)?;
             require_acc(msg, &ix.accounts, 12, &TOKEN_PROGRAM)?;
             require_acc(msg, &ix.accounts, 13, &SYSTEM_PROGRAM)?;
@@ -435,10 +470,12 @@ pub fn validate_launch(msg: &LegacyMessage, check: &LaunchCheck) -> Result<Valid
             require_acc(msg, &ix.accounts, 9, &check.raise)?;
             require_acc(msg, &ix.accounts, 10, &TOKEN_PROGRAM)?;
             require_acc(msg, &ix.accounts, 11, &TOKEN_PROGRAM)?;
-            require_acc(msg, &ix.accounts, 12, &derived.event_authority)?;
-            require_acc(msg, &ix.accounts, 13, &DBC_PROGRAM)?;
+            // Anchor optional None = the program id itself. A real referral ATA is rejected.
+            require_acc(msg, &ix.accounts, 12, &DBC_PROGRAM)?;
+            require_acc(msg, &ix.accounts, 13, &derived.event_authority)?;
+            require_acc(msg, &ix.accounts, 14, &DBC_PROGRAM)?;
             if ix.accounts.len() == SWAP_ACCOUNTS + 1 {
-                require_acc(msg, &ix.accounts, 14, &SYSVAR_INSTRUCTIONS)?;
+                require_acc(msg, &ix.accounts, 15, &SYSVAR_INSTRUCTIONS)?;
             } else if ix.accounts.len() != SWAP_ACCOUNTS {
                 return Err(ShapeError::MissingAccounts);
             }
@@ -563,7 +600,7 @@ pub(crate) mod tests {
         // 7 pool, 8 base_vault, 9 quote_vault, 10 meta, 11 meta_prog, 12 token,
         // 13 ata_prog, 14 system, 15 dbc, 16 event, 17 wsol_ata, 18 token_ata
         let init_accounts = vec![4, 5, 1, 2, 6, 7, 8, 9, 10, 11, 0, 12, 12, 14, 16, 15];
-        let swap_accounts = vec![5, 4, 7, 17, 18, 8, 9, 2, 6, 1, 12, 12, 16, 15];
+        let swap_accounts = vec![5, 4, 7, 17, 18, 8, 9, 2, 6, 1, 12, 12, 15, 16, 15];
         let mut instructions = Vec::new();
         if fee_lamports > 0 {
             instructions.push(CompiledInstruction {
@@ -713,7 +750,7 @@ pub(crate) mod tests {
         let (raise, mint, fee, config, mut msg) = standard();
         msg.instructions.push(CompiledInstruction {
             program_id_index: 15,
-            accounts: vec![5, 4, 7, 17, 18, 8, 9, 2, 6, 1, 12, 12, 16, 15],
+            accounts: vec![5, 4, 7, 17, 18, 8, 9, 2, 6, 1, 12, 12, 15, 16, 15],
             data: swap_data(1, 1),
         });
         let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
@@ -829,9 +866,22 @@ pub(crate) mod tests {
             .iter_mut()
             .find(|ix| ix.data.starts_with(&SWAP_DISC))
             .unwrap();
-        swap.accounts.push(3);
+        swap.accounts[12] = 3; // real account instead of DBC program (None)
         let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
         assert_eq!(err, ShapeError::WrongAccount);
+    }
+
+    #[test]
+    fn rejects_legacy_14_account_swap_without_referral_placeholder() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let swap = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&SWAP_DISC))
+            .unwrap();
+        swap.accounts.remove(12);
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::MissingAccounts);
     }
 
     #[test]
@@ -888,6 +938,163 @@ pub(crate) mod tests {
         let (raise, mint, fee, config, msg) = standard();
         assert!(msg.instructions.last().unwrap().data.first() == Some(&TOKEN_CLOSE_ACCOUNT));
         assert!(validate_launch(&msg, &check(raise, mint, fee, config)).is_ok());
+    }
+
+    fn swap2_data(amount_0: u64, amount_1: u64, mode: u8) -> Vec<u8> {
+        let mut d = SWAP2_DISC.to_vec();
+        d.extend_from_slice(&amount_0.to_le_bytes());
+        d.extend_from_slice(&amount_1.to_le_bytes());
+        d.push(mode);
+        d
+    }
+
+    #[test]
+    fn rejects_swap2_exact_out_mode() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let swap = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&SWAP_DISC))
+            .unwrap();
+        swap.data = swap2_data(985, 1, 2);
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongBuyAmount);
+    }
+
+    #[test]
+    fn accepts_swap2_exact_in_mode() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let swap = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&SWAP_DISC))
+            .unwrap();
+        swap.data = swap2_data(985, 1, SWAP_MODE_EXACT_IN);
+        assert!(validate_launch(&msg, &check(raise, mint, fee, config)).is_ok());
+    }
+
+    #[test]
+    fn rejects_swap_with_trailing_data() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let swap = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&SWAP_DISC))
+            .unwrap();
+        swap.data.push(0);
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongParams);
+    }
+
+    #[test]
+    fn rejects_swap2_partial_fill_mode() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let swap = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&SWAP_DISC))
+            .unwrap();
+        swap.data = swap2_data(985, 1, 1);
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongBuyAmount);
+    }
+
+    #[test]
+    fn rejects_swap2_with_trailing_data() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let swap = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&SWAP_DISC))
+            .unwrap();
+        let mut data = swap2_data(985, 1, SWAP_MODE_EXACT_IN);
+        data.push(0);
+        swap.data = data;
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongParams);
+    }
+
+    #[test]
+    fn rejects_swap_zero_min_out() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let swap = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&SWAP_DISC))
+            .unwrap();
+        swap.data = swap_data(985, 0);
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongBuyAmount);
+    }
+
+    #[test]
+    fn rejects_raise_as_ata_payer() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        msg.instructions[1].accounts[0] = 1;
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongSource);
+    }
+
+    #[test]
+    fn rejects_raise_as_init_payer() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let init = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&INIT_POOL_DISC))
+            .unwrap();
+        init.accounts[10] = 1;
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongSource);
+    }
+
+    #[test]
+    fn rejects_fee_as_ata_payer() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        msg.instructions[1].accounts[0] = 3;
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongSource);
+    }
+
+    #[test]
+    fn rejects_mint_as_init_payer() {
+        let (raise, mint, fee, config, mut msg) = standard();
+        let init = msg
+            .instructions
+            .iter_mut()
+            .find(|ix| ix.data.starts_with(&INIT_POOL_DISC))
+            .unwrap();
+        init.accounts[10] = 2;
+        let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
+        assert_eq!(err, ShapeError::WrongSource);
+    }
+
+    #[test]
+    fn accepts_sdk_golden_launch_message() {
+        let raw = include_str!("../../tests/fixtures/sdk_launch.json");
+        let v: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(raw).unwrap();
+        let bytes = near_sdk::base64::engine::Engine::decode(
+            &near_sdk::base64::engine::general_purpose::STANDARD,
+            v["messageBase64"].as_str().unwrap(),
+        )
+        .unwrap();
+        let msg = parse_legacy_message(&bytes).expect("golden message must parse");
+        let raise = bs58::decode_pubkey(v["raise"].as_str().unwrap()).unwrap();
+        let mint = bs58::decode_pubkey(v["mint"].as_str().unwrap()).unwrap();
+        let fee = bs58::decode_pubkey(v["fee"].as_str().unwrap()).unwrap();
+        let config = bs58::decode_pubkey(v["config"].as_str().unwrap()).unwrap();
+        let got = validate_launch(&msg, &check(raise, mint, fee, config)).expect("honest SDK tx");
+        assert_eq!(got.buy_lamports, 985);
+        assert_eq!(got.fill_fee_in_tx, 15);
+        let swap = msg
+            .instructions
+            .iter()
+            .find(|ix| ix.data.starts_with(&SWAP_DISC) || ix.data.starts_with(&SWAP2_DISC))
+            .unwrap();
+        assert_eq!(swap.accounts.len(), 16);
+        assert_eq!(acc(&msg, &swap.accounts, 12).unwrap(), &DBC_PROGRAM);
+        assert_eq!(acc(&msg, &swap.accounts, 15).unwrap(), &SYSVAR_INSTRUCTIONS);
+        assert_eq!(swap.data.len(), 24);
     }
 
     pub(crate) fn fixture_launch_bytes(

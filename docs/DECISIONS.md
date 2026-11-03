@@ -62,7 +62,7 @@ Milestone 2 (post live test): `create_trust(config)` **requires a watcher** and 
 
 **Watcher trust assumption:** NEAR cannot see Solana. The watcher can delay a raise, under/over-report deposits among real contributors, and delay `confirm_transfer`. It cannot change destinations: every signed transfer source and dest is a stored derived key or the contributor's own pubkey. Anyone can run a second watcher to audit reports against explorers. This is the PLAN §4 trust point, restated after R1.
 
-**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): Milestone 2 was **251 850 bytes** after -Oz. Milestone 3 Shape C is **298 962 bytes** after -Oz (531 855 before; PDA pin added sha2 + curve25519-dalek).
+**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): Milestone 2 was **251 850 bytes** after -Oz. Milestone 3 Shape C (m7 pin) is **299 355 bytes** after -Oz (532 452 before).
 
 ## Milestone 3 — Shape C DBC launch (3 Nov 2026)
 
@@ -92,6 +92,16 @@ Borsh layout adds `mint_path`, `mint_address`, `pool_address`, `fill_fee_paid` o
 | Refund rent dust | If leftover would be `0 < x < 890_880`, refund the full remaining deposit (close-out) |
 | E `register` after close | Rejected in Launched and Refunding |
 | Silent `cap_bps` default | Required field |
+
+### Live m7 holes (same PR)
+
+| Hole | Fix |
+| --- | --- |
+| F honest SDK launch rejected | Swap pin is the IDL 15-account list. Index 12 = DBC program id (`None` referral). Event @13, program @14, optional sysvar @15. Golden fixture from SDK 2.0.0 builder. |
+| G ExactOut swap2 signed | `swap` data is exactly 24 bytes. `swap2` is exactly 25 bytes with `swap_mode = ExactIn (0)`. `minimum_amount_out ≥ 1`. Trailing bytes rejected. |
+| H partial refund signed | Refund / raise-refund must equal the full refundable (or dust close-out). |
+| Launch lock griefing | `request_launch`, `request_fill_fee`, `request_sweep` are watcher-only. Refunds stay permissionless for liveness (contributors have no bound NEAR identity). A stranger can still lock a full refund for 150 s at 0.01 NEAR — documented leftover, not scaled this PR. |
+| Raise still paid init/ATA rent | Init payer and every ATA-create payer must be the tx fee payer (relayer), never raise / mint / fee vault. |
 
 ## MPC `sign` gas and Solana fee payer (3 Nov 2026)
 

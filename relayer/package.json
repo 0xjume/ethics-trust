@@ -14,6 +14,7 @@
     "deploy-testnet": "tsx src/deploy-testnet.ts",
     "create-dbc-config": "tsx src/create-dbc-config.ts",
     "build-launch-message": "tsx src/build-launch-message.ts",
+    "generate-golden-launch": "tsx src/generate-golden-launch.ts",
     "request-launch": "tsx src/request-launch.ts",
     "relay-launch": "tsx src/relay-launch.ts",
     "confirm-launch": "tsx src/confirm-launch.ts"

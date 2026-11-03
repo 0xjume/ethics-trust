@@ -89,8 +89,10 @@ vault mechanic. Patterns only; no copied modules.
   **delay** the raise and **skew the pro-rata split among registered
   contributors**. It cannot send funds to any address the contract did not fix
   (owner, raise vault, DBC pool, contributors, fixed fee destinations). Anyone
-  can run a watcher. `confirm_transfer` is watcher-only. Refunds after the
-  deadline are permissionless except that confirm still needs the named watcher.
+  can run a watcher. `confirm_transfer`, `request_launch`, `request_sweep`,
+  and `request_fill_fee` are watcher-only. Refunds stay permissionless
+  (full amount only) so a contributor can exit if the watcher is offline;
+  confirm still needs the named watcher.
 - **Sybil.** The 1% cap is per *wallet*. One person can split into many wallets.
   Good enough for a demo, not a fairness guarantee.
 - **DBC config.** Created once; the Trust pins its pubkey. `feeClaimer` and
