@@ -2,7 +2,9 @@
  * Watcher stub. The named watcher set at `create_trust` is the only
  * predecessor that may call `report_deposit` and `confirm_transfer`.
  * It is trusted for liveness and pro-rata inputs; it cannot redirect
- * destinations. Anyone may `release_pending` after ~90s.
+ * destinations. Anyone may `release_pending` after ~150s (past the Solana
+ * blockhash lifetime). A late confirm of a released hash must use a new
+ * solana_sig and fit the remaining budget.
  *
  * After a sweep / refund / raise-refund signature lands on Solana:
  *   confirm_transfer({ message_hash: sha256(unsigned_message) hex,

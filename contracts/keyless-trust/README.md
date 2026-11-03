@@ -17,7 +17,11 @@ scripts/build-wasm.sh   # release + wasm-opt -Oz when binaryen is installed
 cargo test -p keyless-trust --test sandbox -- --ignored
 ```
 
+`register` attaches 0.005 NEAR; sweep/refund/raise-refund attach 0.001 NEAR
+(views `register_deposit` / `sign_deposit`). Pending expiry is 150 s.
+
 Deploy to a subaccount of `keyless-trust-dev-54ef71.testnet` only with
 `EXECUTE_DEPLOY=1` and parent creds: `scripts/deploy-testnet.sh`.
-Storage deposit is computed from wasm size (floor 5.5 NEAR). Testnet only.
+Storage deposit is computed from wasm size (floor 5.5 NEAR). No full-access
+key is left on the contract unless `DEPLOY_KEEP_KEY=1`. Testnet only.
 No secrets in this repo.

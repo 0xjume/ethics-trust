@@ -7,6 +7,8 @@
  *
  * Storage deposit is computed from wasm size (≈1 NEAR / 100 KiB + 0.5 NEAR
  * overhead), with a 5.5 NEAR floor. Override with DEPLOY_NEAR.
+ * By default the contract account has **no** full-access key (keyless).
+ * Set DEPLOY_KEEP_KEY=1 only if you need the parent key on the contract.
  *
  *   scripts/build-wasm.sh
  *   NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
@@ -22,6 +24,7 @@ import {
   JsonRpcProvider,
   KeyPair,
   type KeyPairString,
+  PublicKey,
   actions,
   nearToYocto,
   teraToGas,
@@ -90,24 +93,17 @@ export async function deployTestnet(env: Record<string, string | undefined> = pr
   const provider = new JsonRpcProvider({ url: env.NEAR_RPC_URL ?? TESTNET_RPC });
   const parent = new Account(accountId, provider, privateKey);
   const publicKey = KeyPair.fromString(privateKey).getPublicKey();
+  const keepKey = keepDeployFullAccessKey(env);
 
   const outcome = await parent.signAndSendTransaction({
     receiverId: target.contractId,
-    actions: [
-      actions.createAccount(),
-      actions.transfer(nearToYocto(depositNear)),
-      actions.addFullAccessKey(publicKey),
-      actions.deployContract(wasm),
-      actions.functionCall(
-        "new",
-        {
-          mpc_contract: env.MPC_CONTRACT ?? null,
-          dbc_program: null,
-        },
-        teraToGas(30),
-        0n,
-      ),
-    ],
+    actions: deployAccountActions({
+      wasm,
+      depositNear,
+      publicKey,
+      keepFullAccessKey: keepKey,
+      mpcContract: env.MPC_CONTRACT ?? null,
+    }),
   });
 
   const hash = outcome.transaction.hash;
@@ -118,7 +114,43 @@ export async function deployTestnet(env: Record<string, string | undefined> = pr
     explorer: `https://testnet.nearblocks.io/txns/${hash}`,
     depositNear,
     wasmBytes: wasm.byteLength,
+    keepFullAccessKey: keepKey,
   };
+}
+
+export function keepDeployFullAccessKey(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.DEPLOY_KEEP_KEY === "1";
+}
+
+export function deployAccountActions(args: {
+  wasm: Uint8Array;
+  depositNear: number;
+  publicKey: PublicKey;
+  keepFullAccessKey: boolean;
+  mpcContract: string | null;
+}) {
+  const out = [
+    actions.createAccount(),
+    actions.transfer(nearToYocto(args.depositNear)),
+  ];
+  if (args.keepFullAccessKey) {
+    out.push(actions.addFullAccessKey(args.publicKey));
+  }
+  out.push(
+    actions.deployContract(args.wasm),
+    actions.functionCall(
+      "new",
+      {
+        mpc_contract: args.mpcContract,
+        dbc_program: null,
+      },
+      teraToGas(30),
+      0n,
+    ),
+  );
+  return out;
 }
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { KeyPair } from "near-api-js";
 import {
   defaultWasmPath,
+  deployAccountActions,
+  keepDeployFullAccessKey,
   resolveDeployTarget,
   storageDepositNear,
 } from "./deploy-testnet.ts";
@@ -43,5 +46,34 @@ describe("storageDepositNear", () => {
 
   it("grows with larger wasm", () => {
     assert.ok(storageDepositNear(800_000) > 5.5);
+  });
+});
+
+describe("deployAccountActions", () => {
+  const publicKey = KeyPair.fromRandom("ed25519").getPublicKey();
+  const wasm = new Uint8Array([0, 1, 2]);
+
+  it("omits the parent full-access key by default", () => {
+    assert.equal(keepDeployFullAccessKey({}), false);
+    const acts = deployAccountActions({
+      wasm,
+      depositNear: 5.5,
+      publicKey,
+      keepFullAccessKey: false,
+      mpcContract: null,
+    });
+    assert.equal(acts.length, 4);
+  });
+
+  it("adds the key only when DEPLOY_KEEP_KEY=1", () => {
+    assert.equal(keepDeployFullAccessKey({ DEPLOY_KEEP_KEY: "1" }), true);
+    const acts = deployAccountActions({
+      wasm,
+      depositNear: 5.5,
+      publicKey,
+      keepFullAccessKey: true,
+      mpcContract: null,
+    });
+    assert.equal(acts.length, 5);
   });
 });
