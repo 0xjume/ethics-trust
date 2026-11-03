@@ -56,7 +56,9 @@ Meteora BUILD rules that still apply: `@solana/web3.js` v1 only (not `@solana/ki
 
 `cargo-near` was not installed in the agent image. The crate layout matches the `cargo near new` template (cdylib+rlib, overflow-checks on workspace `[profile.release]` / `[profile.dev]`, wasm32). Do not invent a different layout.
 
-Day-1 audit against `.agents/skills/near-contract-audit`: callbacks are `#[private]`; `request_refund_sign` and `register` take 1 yoctoNEAR; unique map prefix `t`; `#[init]` + `PanicOnDefault`; no `Default` impl that skips init. `register` does **not** yet persist contributors (scaffold). `request_refund_sign` currently labels the path with hex of the 32-byte source; a later PR must persist the base58 pubkey from `register`.
+Day-1 audit against `.agents/skills/near-contract-audit`: callbacks are `#[private]`; `request_refund` / `request_sweep` / `register` / `report_deposit` take 1 yoctoNEAR; unique map prefixes `t` (trusts), `c` (ledger), `s` (seen sigs); `#[init]` + `PanicOnDefault`; no `Default` impl that skips init.
+
+Milestone 2: `register` persists the contributor row. `create_trust(config)` stores Raising + 1% cap + 1.5% fill fee + 24h execution timeout + `params_hash` (sha256 of DBC config/name/symbol/uri). `request_sweep` / `request_refund` re-derive destinations on chain (raise vault from `request_derived_key`, refund dest = contributor pubkey) and attach **30 TGas** to MPC `sign`. Optimistic swept/refunded counters roll back if `sign` fails.
 
 ## MPC `sign` gas and Solana fee payer (3 Nov 2026)
 
@@ -69,7 +71,7 @@ Explorer links: `docs/spikes.md`.
 | Decision | Why |
 | --- | --- |
 | Relayer keypair is the Solana **fee payer** and signs locally | Vault balance dropped by **exactly 1 000 000 lamports** each run. The vault still signs the System transfer as source. |
-| Direct `sign` attaches **30 TGas** (`DEFAULT_MPC_SIGN_TGAS`, overridable via `MPC_SIGN_TGAS`) | Burnt gas was **8.84 TGas** each time. 30 is enough headroom. The contract still attaches 250 TGas for yield/resume + callback (`mpc.rs`), which is a different call path. |
+| Direct `sign` attaches **30 TGas** (`DEFAULT_MPC_SIGN_TGAS` and `mpc.rs` `MPC_SIGN_GAS`) | Burnt gas was **8.84 TGas** each time. 30 is enough headroom. Callbacks still get 20 TGas. |
 | No durable nonce | Sign 6.8–7.5 s, send→confirmed ~2.6 s, total ~14 s. The blockhash stayed valid. |
 | Devnet submit **works** | Three confirmed transfers. CI still refuses to call `sign` or submit unless `EXECUTE_NEAR_SIGNED_TRANSFER=1` (and `SOLANA_SUBMIT=1` for send). |
 

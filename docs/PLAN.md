@@ -1,6 +1,6 @@
 # Keyless Trust: build plan (NEAR HACKATHON, track `memecoins`)
 
-Status: research plan plus day-1 scaffold (this repo). No funded accounts, deploys, or spend. SDK pins and spike numbers: `docs/DECISIONS.md`, `docs/spikes.md`.
+Status: research plan plus day-1 scaffold and milestone-2 chip-in / refund / sweep. No funded accounts or spend in the agent env; deploy script is documented. SDK pins and spike numbers: `docs/DECISIONS.md`, `docs/spikes.md`.
 Prepared 3 Nov 2026 (WIB). Scope chosen by Jume: Track A only, a separate hackathon entry, testnet and devnet only, submitted before 15 Nov 2026 06:59 WIB.
 
 > One line: community token raises on Solana where no person or server holds the vaults. A NEAR contract controls every vault through Chain Signatures and will only ever sign five transaction shapes: refund, capped sweep, Meteora DBC create-and-buy, pro-rata distribution, and (stretch) the 70/20/10 fee split.
@@ -107,7 +107,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 
 **Fee payer** = account key 0. Two allowed modes:
 - the vault being spent (it pays its own 5,000-lamport fee; contract caps priority fee as above), or
-- a relayer key that co-signs (lets USDC-only deposits move without SOL). The relayer key must not be writable in any instruction except as fee payer. MVP: SOL-only, vault pays.
+- a relayer key that co-signs (lets the vault balance stay exact). The relayer key must not be writable in any instruction except as fee payer. Milestone 2 default: relayer pays; vault-paid still allowed.
 
 **Blockhash**: NEAR cannot check freshness, and does not need to: a stale blockhash only makes the tx fail. The real danger is *double execution* when the same intent is signed twice with two blockhashes. Each shape is therefore designed so that a second landing either fails or does nothing harmful (see per-shape notes). If day-1 latency (MPC sign ~2–3 s documented, plus NEAR finality) approaches the ~60–90 s blockhash lifetime, switch to a **durable nonce** per vault: message's first instruction is `AdvanceNonceAccount(nonce_acct, authority = vault)`, contract checks it, and a signed message then never expires, so the relayer can retry forever without re-signing.
 
@@ -151,14 +151,17 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
             create_trust
                  │
                  ▼
-   ┌──────────► Open ──(deadline passed, Σ reported < target)──► Refunding ──► Closed
-   │             │                                                   ▲
-   │  (Σ reported deposits ≥ target, before deadline)               │
-   │             ▼                                                   │
-   │         Executing ──(24 h execution timeout, not Launched)──────┘
-   │             │  sweeps (B) → create-and-buy (C)
+   ┌──────────► Raising ──(deadline passed, Σ credited < target)──► Refunding
+   │             │
+   │  (Σ credited ≥ target, before deadline)
    │             ▼
-   │          Launched ──► Distributing (D) ──► Distributed ──(stretch) fee split (E), repeatable
+   │          Filled ──(24 h execution timeout)────────────────────► Refunding
+   │             │ first sweep
+   │             ▼
+   │         Executing ──(24 h from start, not Launched)───────────► Refunding
+   │             │  sweeps (B) → create-and-buy (C)   [next milestone]
+   │             ▼
+   │          Launched ──► pro-rata (D) ── (stretch) fee split (E)
 ```
 - Defaults (Ethics patterns, re-implemented): cap 1% of target per wallet, deadline set at creation, 24 h execution timeout, 1.5% fill fee to the fee vault (taken from the raise before the buy; MVP may set 0), fee split 70/20/10.
 - `Refunding`: any caller can request Shape A for any registered deposit; also covers deposits that arrive late.

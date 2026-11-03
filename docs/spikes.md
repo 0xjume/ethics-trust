@@ -41,7 +41,8 @@ Live decode (same script): 37 219 `PoolConfig` accounts and 96 819 `VirtualP
 
 Host-side `env::used_gas()` after parse + Shape A check: **264 768 111 gas** (~0.26 TGas; `parser_gas_estimate_tgas=0` because the mock reports less than 1 TGas). This is the near-sdk mock runtime, not wasm / near-workspaces. A sandbox gas trace still needs a funded or local near-sandbox binary.
 
-Release wasm: `target/wasm32-unknown-unknown/release/keyless_trust.wasm` **322 671 bytes**.
+Release wasm (day-1): `target/wasm32-unknown-unknown/release/keyless_trust.wasm` **322 671 bytes**.
+Milestone 2 wasm: **405 499 bytes** (parser + ledger + sweep/refund).
 
 ## d) NEAR-signed Solana transfer (end to end)
 
@@ -70,8 +71,49 @@ Full Solana signatures:
 
 The script uses a **local relayer keypair as Solana fee payer** (vault still signs the transfer) and attaches `DEFAULT_MPC_SIGN_TGAS = 30`. CI never runs the MPC call (`EXECUTE_NEAR_SIGNED_TRANSFER` unset → `{ skipped: true }`).
 
+## e) Milestone 2 contract (chip-in / refund / sweep)
+
+`cargo test -p keyless-trust` — unit tests for the state machine, 1% cap math,
+overflow, refund eligibility, relayer-paid Shape A/B, and attacker destinations.
+
+MPC `sign` on the contract path now attaches **30 TGas** (`mpc.rs`), matching
+the live burn of **8.84 TGas**. Callback 20 TGas.
+
+`pnpm deposit-address` (read-only) calls `v1.signer-prod.testnet.derived_public_key`
+for `trust/<id>/in/<pubkey>`. When `CONTRACT_ID` is set it uses the on-chain
+`deposit_address` view first.
+
+near-workspaces is **not** a default-CI dep (no near-sandbox download). The
+practical MPC mock is the unit-test callbacks. See
+`contracts/keyless-trust/tests/sandbox.rs` for the later workspaces recipe.
+
+### Live deploy (blocked in this environment)
+
+This agent has **no** `NEAR_*` / `SOLANA_*` credentials. The e2e `sign` from
+spike (d) used `keyless-trust-dev-54ef71.testnet` as a predecessor, not a
+deployed contract. Exact deploy (testnet only):
+
+```bash
+cargo build -p keyless-trust --target wasm32-unknown-unknown --release
+NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
+NEAR_PRIVATE_KEY=ed25519:... \
+DEPLOY_SUBACCOUNT=m2 \
+EXECUTE_DEPLOY=1 \
+pnpm deploy-testnet
+# → m2.keyless-trust-dev-54ef71.testnet
+# wrapper: scripts/deploy-testnet.sh
+```
+
+Paste the resulting NEAR tx here once a human runs it:
+
+- deploy `new`: _(pending — no creds in the agent env)_
+
+After deploy, `CONTRACT_ID=m2.keyless-trust-dev-54ef71.testnet pnpm deposit-address`
+should match the same derived Solana address as a raw `derived_public_key` call
+with predecessor = that contract id.
+
 ## Still needs funded testnet / devnet accounts
 
 - A human-created NEAR testnet account to **deploy** `keyless-trust` (the e2e `sign` used `keyless-trust-dev-54ef71.testnet` as predecessor, not a deployed contract)
 - A paid or created DBC **config** (createConfig2) that this Trust pins; dummy keys cannot initialise a pool
-- Landing create-and-buy, sweeps, refunds, and a near-workspaces gas trace
+- Landing create-and-buy, live sweeps/refunds from the deployed contract, and a near-workspaces gas trace
