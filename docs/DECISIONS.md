@@ -62,7 +62,7 @@ Milestone 2 (post live test): `create_trust(config)` **requires a watcher** and 
 
 **Watcher trust assumption:** NEAR cannot see Solana. The watcher can delay a raise, under/over-report deposits among real contributors, and delay `confirm_transfer`. It cannot change destinations: every signed transfer source and dest is a stored derived key or the contributor's own pubkey. Anyone can run a second watcher to audit reports against explorers. This is the PLAN §4 trust point, restated after R1.
 
-**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): Milestone 2 was **251 850 bytes** after -Oz. Milestone 3 Shape C is **279 233 bytes** after -Oz (503 139 before).
+**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): Milestone 2 was **251 850 bytes** after -Oz. Milestone 3 Shape C is **298 962 bytes** after -Oz (531 855 before; PDA pin added sha2 + curve25519-dalek).
 
 ## Milestone 3 — Shape C DBC launch (3 Nov 2026)
 
@@ -71,7 +71,7 @@ User overrides of PLAN.md (follow the user):
 | Decision | Why |
 | --- | --- |
 | `leftoverReceiver` = **raise vault** | Graduation leftover stays in the Trust-owned raise, not the fee vault. `feeClaimer` is still the fee vault. |
-| `poolCreator` / `payer` / first-buy `buyer` = **raise vault** | One MPC path spends the raise. Relayer is only the Solana fee payer. |
+| `poolCreator` / first-buy `buyer` = **raise vault**; init `payer` and ATA payer may be the **relayer** | Relayer funds pool-account + ATA rent (~0.0236 SOL on the m6 live run). Raise only spends fill fee + first-buy wrap. |
 | Base mint = MPC path `trust/<id>/mint` | No random keypair. Contract derives it at `create_trust` and signs the launch message twice (`Promise::and` raise + mint). |
 | First buy = `credited_total − fill_fee` | Fill fee is 1.5% (150 bps) raise → fee vault, in the same tx **or** a prior `request_fill_fee`. `minimum_amount_out ≥ 1`. |
 | `request_launch` attach **≥ 90 TGas** | Two 30 TGas `sign` calls + 20 TGas callback. View `launch_attach_tgas()`. |
@@ -79,7 +79,19 @@ User overrides of PLAN.md (follow the user):
 | Confirmed launch → `Launched` | `confirm_transfer` records `pool_address` and adds any in-tx fill fee to `fill_fee_paid`. No ledger row. |
 | `request_distribute` panics | Milestone 4 stub. |
 
-Borsh layout adds `mint_path`, `mint_address`, `pool_address`, `fill_fee_paid` on `Trust` and `extra` on `PendingTransfer`. Deploy a **new** subaccount (**m6**); do not reuse m5.
+Borsh layout adds `mint_path`, `mint_address`, `pool_address`, `fill_fee_paid` on `Trust` and `extra` on `PendingTransfer`. `CreateTrustConfig.cap_bps` is a required `u16` (1..=10_000). Deploy a **new** subaccount after this change (**m7** if m6 is already live); do not reuse m5/m6.
+
+### Live m6 holes (same PR)
+
+| Hole | Fix |
+| --- | --- |
+| C extra System transfer from raise | Only fee → fee vault and wrap → raise WSOL ATA (`buy` lamports) + SyncNative on that ATA |
+| D redirected swap output ATA | Derive and pin all 16 init + 14 swap + ATA/SyncNative/close accounts |
+| A raise rent top-up | Relayer is init + ATA payer. The SDK first-buy still sets ATA payer = buyer; `retargetAtaPayer` rewrites those ixs to the relayer. Swap may include `Sysvar1nstructions` when `enableFirstSwapWithMinFee`. |
+| B `closeAccount` rejected | Allowed only on raise WSOL ATA, dest + authority = raise |
+| Refund rent dust | If leftover would be `0 < x < 890_880`, refund the full remaining deposit (close-out) |
+| E `register` after close | Rejected in Launched and Refunding |
+| Silent `cap_bps` default | Required field |
 
 ## MPC `sign` gas and Solana fee payer (3 Nov 2026)
 

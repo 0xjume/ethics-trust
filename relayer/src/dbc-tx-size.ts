@@ -80,7 +80,7 @@ export async function buildDbcSizeReport() {
         name: "Keyless",
         symbol: "KLT",
         uri: "https://ethics.ltd/k.json",
-        payer: raiseVault,
+        payer,
         poolCreator: raiseVault,
       },
       firstBuyParam: {

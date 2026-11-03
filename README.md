@@ -5,9 +5,10 @@ Community token raises whose Solana vaults no person or server holds.
 A NEAR contract owns every Trust vault (per-contributor deposit, raise vault,
 fee vault) through NEAR Chain Signatures (Ed25519, `domain_id` 1,
 `v1.signer-prod.testnet`) and will only sign allowed Solana transaction shapes:
-refund to the contributor, a capped 1% sweep into the raise vault, a Meteora
-DBC create-and-buy into the pinned config, pro-rata token distribution, and
-(stretch) a 70/20/10 fee split.
+refund to the contributor, a capped sweep (`cap_bps` required at create), a
+Meteora DBC create-and-buy into the pinned config (relayer pays pool/ATA
+rent; every launch account is derived and pinned), pro-rata token
+distribution, and (stretch) a 70/20/10 fee split.
 
 NEAR HACKATHON 2026 · track `memecoins` · **testnet and Solana devnet only**.
 

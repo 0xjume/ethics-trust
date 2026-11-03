@@ -3,7 +3,6 @@
 
 use crate::TrustState;
 
-pub const DEFAULT_CAP_BPS: u16 = 100;
 pub const DEFAULT_FILL_FEE_BPS: u16 = 150;
 pub const BPS_DENOM: u64 = 10_000;
 pub const EXECUTION_TIMEOUT_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
@@ -79,6 +78,27 @@ pub fn raise_refundable_lamports(state: &TrustState, swept: u64, raise_refunded:
 /// that window, so a pending that can be `release_pending`'d can no
 /// longer land on Solana. A late honest confirm (no re-sign) still books.
 pub const PENDING_EXPIRY_NS: u64 = 150 * 1_000_000_000;
+/// Solana system-account rent-exempt minimum. A transfer that would leave
+/// `0 < leftover < RENT_EXEMPT_MIN` cannot land; refund the full remaining
+/// balance instead (close-out).
+pub const RENT_EXEMPT_MIN: u64 = 890_880;
+
+/// If an otherwise-valid refund would leave a live account below rent-exempt,
+/// boost to the full remaining balance so the source can go to zero.
+pub fn apply_rent_dust_closeout(eligible: u64, remaining_on_account: u64) -> u64 {
+    if eligible == 0 {
+        return 0;
+    }
+    let leftover = remaining_on_account.saturating_sub(eligible);
+    if remaining_on_account >= RENT_EXEMPT_MIN
+        && leftover > 0
+        && leftover < RENT_EXEMPT_MIN
+    {
+        remaining_on_account
+    } else {
+        eligible
+    }
+}
 
 /// Sweep only after the raise is filled. Never more than credited − swept,
 /// so a wallet cannot push more than 1% of target into the raise vault.
@@ -176,6 +196,14 @@ mod tests {
     fn raise_refund_only_in_refunding() {
         assert_eq!(raise_refundable_lamports(&TrustState::Executing, 10, 0), 0);
         assert_eq!(raise_refundable_lamports(&TrustState::Refunding, 10, 3), 7);
+    }
+
+    #[test]
+    fn rent_dust_closeout_only_when_leftover_is_below_rent() {
+        assert_eq!(apply_rent_dust_closeout(200_000, 1_000_000), 1_000_000);
+        assert_eq!(apply_rent_dust_closeout(40, 50), 40);
+        assert_eq!(apply_rent_dust_closeout(40, 2_000_000), 40);
+        assert_eq!(apply_rent_dust_closeout(0, 1_000_000), 0);
     }
 
     #[test]

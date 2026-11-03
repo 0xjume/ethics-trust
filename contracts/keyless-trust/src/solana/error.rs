@@ -43,6 +43,8 @@ pub enum ShapeError {
     WrongBuyAmount,
     WrongFillFee,
     MissingLaunchIx,
+    WrongAccount,
+    WrongWrap,
 }
 
 impl ShapeError {
@@ -66,6 +68,8 @@ impl ShapeError {
             Self::WrongBuyAmount => "first-buy amount_in is not raise total minus fill fee",
             Self::WrongFillFee => "fill fee transfer is missing or not raise → fee vault",
             Self::MissingLaunchIx => "launch message needs initialize_virtual_pool + swap",
+            Self::WrongAccount => "launch instruction account does not match the derived pin",
+            Self::WrongWrap => "wSOL wrap must be raise → raise WSOL ATA for the first-buy amount, then SyncNative",
         }
     }
 }

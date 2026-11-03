@@ -182,22 +182,23 @@ A leftover-budget late confirm is rejected (`amount exceeds remaining budget`).
 
 Account: [m5.keyless-trust-dev-54ef71.testnet](https://testnet.nearblocks.io/address/m5.keyless-trust-dev-54ef71.testnet).
 
-### Milestone 3 deploy recipe (m6)
+### Milestone 3 deploy recipe (m7 after the m6 live-test fixes)
 
-Borsh added mint/pool/fill-fee fields. Deploy a **new** subaccount; do not
-reuse m5. Human-run on testnet + Solana **devnet** (this agent does not
-deploy or spend).
+Borsh added mint/pool/fill-fee fields and made `cap_bps` required. Deploy a
+**new** subaccount; do not reuse m5 or m6. Relayer pays init + ATA rent —
+do not send extra SOL to the raise vault. Human-run on testnet + Solana
+**devnet** (this agent does not deploy or spend).
 
 ```bash
 scripts/build-wasm.sh
 NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
 NEAR_PRIVATE_KEY=ed25519:... \
-DEPLOY_SUBACCOUNT=m6 \
+DEPLOY_SUBACCOUNT=m7 \
 EXECUTE_DEPLOY=1 \
 pnpm deploy-testnet
-# → m6.keyless-trust-dev-54ef71.testnet  (waitUntil FINAL, no full-access key)
+# → m7.keyless-trust-dev-54ef71.testnet  (waitUntil FINAL, no full-access key)
 
-export CONTRACT_ID=m6.keyless-trust-dev-54ef71.testnet
+export CONTRACT_ID=m7.keyless-trust-dev-54ef71.testnet
 export NEAR_PREDECESSOR=$CONTRACT_ID
 export TRUST_ID=1
 
@@ -208,7 +209,7 @@ pnpm derive-addresses
 EXECUTE_CREATE_CONFIG=1 pnpm create-dbc-config
 # copy config pubkey → DBC_CONFIG
 
-# 3. create_trust({ dbc_config: $DBC_CONFIG, name, symbol, uri, watcher, target_lamports, deadline_ns })
+# 3. create_trust({ dbc_config, name, symbol, uri, watcher, target_lamports, deadline_ns, cap_bps })
 #    Wait for derived raise/fees/mint addresses (or request_derived_key kind=mint).
 
 # 4. Register, report_deposit, request_sweep, confirm_transfer until

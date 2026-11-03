@@ -2,12 +2,13 @@
  * Build a legacy Shape C message: optional fill-fee System transfer +
  * DBC createPoolWithFirstBuy (initialize_virtual_pool_with_spl_token + swap).
  *
- * poolCreator = payer = buyer = raise vault
+ * poolCreator = buyer = raise vault
+ * init / ATA payer = relayer (funds pool + ATA rent; raise does not top up)
  * baseMint = derived trust/<id>/mint (no random keypair)
  * first buy = credited_total − 1.5% fill fee
  * min out = 1
  *
- * Relayer is the Solana fee payer. Does not send. Prints base64 + hash + size.
+ * Relayer is the Solana fee payer and the init/ATA rent payer. Does not send.
  *
  * Env: CONTRACT_ID, TRUST_ID, DBC_CONFIG, CREDITED_LAMPORTS,
  *      TOKEN_NAME / TOKEN_SYMBOL / TOKEN_URI, SOLANA_RELAYER_KEYPAIR,
@@ -15,6 +16,7 @@
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { ASSOCIATED_TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import BN from "bn.js";
@@ -60,6 +62,24 @@ export function prependFillFee(
   out.feePayer = tx.feePayer;
   out.recentBlockhash = tx.recentBlockhash;
   return out;
+}
+
+/** SDK first-buy ATA creates use buyer=raise as payer. Point them at the relayer. */
+export function retargetAtaPayer(
+  tx: Transaction,
+  from: PublicKey,
+  to: PublicKey,
+): Transaction {
+  for (const ix of tx.instructions) {
+    if (!ix.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) {
+      continue;
+    }
+    if (ix.keys[0] && ix.keys[0].pubkey.equals(from)) {
+      ix.keys[0].pubkey = to;
+      ix.keys[0].isSigner = true;
+    }
+  }
+  return tx;
 }
 
 export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
@@ -109,7 +129,7 @@ export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
       name,
       symbol,
       uri,
-      payer: raise,
+      payer: relayer.publicKey,
       poolCreator: raise,
     },
     firstBuyParam: {
@@ -119,6 +139,7 @@ export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
       referralTokenAccount: null,
     },
   });
+  retargetAtaPayer(poolTx, raise, relayer.publicKey);
   if (!alreadyPaid && fee > 0n) {
     poolTx = prependFillFee(poolTx, raise, fees, Number(fee));
   }
