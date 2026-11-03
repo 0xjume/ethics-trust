@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { KeyPair } from "near-api-js";
 import {
+  DEPLOY_WAIT_UNTIL,
   defaultWasmPath,
   deployAccountActions,
   keepDeployFullAccessKey,
@@ -63,6 +64,10 @@ describe("deployAccountActions", () => {
       mpcContract: null,
     });
     assert.equal(acts.length, 4);
+  });
+
+  it("waits for FINAL before returning", () => {
+    assert.equal(DEPLOY_WAIT_UNTIL, "FINAL");
   });
 
   it("adds the key only when DEPLOY_KEEP_KEY=1", () => {

@@ -17,8 +17,9 @@ scripts/build-wasm.sh   # release + wasm-opt -Oz when binaryen is installed
 cargo test -p keyless-trust --test sandbox -- --ignored
 ```
 
-`register` attaches 0.005 NEAR; sweep/refund/raise-refund attach 0.001 NEAR
+`register` attaches 0.005 NEAR; sweep/refund/raise-refund attach 0.01 NEAR
 (views `register_deposit` / `sign_deposit`). Pending expiry is 150 s.
+A re-sign supersedes earlier released hashes for the same lock.
 
 Deploy to a subaccount of `keyless-trust-dev-54ef71.testnet` only with
 `EXECUTE_DEPLOY=1` and parent creds: `scripts/deploy-testnet.sh`.

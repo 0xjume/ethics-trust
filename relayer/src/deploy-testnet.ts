@@ -104,6 +104,7 @@ export async function deployTestnet(env: Record<string, string | undefined> = pr
       keepFullAccessKey: keepKey,
       mpcContract: env.MPC_CONTRACT ?? null,
     }),
+    waitUntil: DEPLOY_WAIT_UNTIL,
   });
 
   const hash = outcome.transaction.hash;
@@ -117,6 +118,9 @@ export async function deployTestnet(env: Record<string, string | undefined> = pr
     keepFullAccessKey: keepKey,
   };
 }
+
+/** Wait for the deploy tx to be final before the script returns. */
+export const DEPLOY_WAIT_UNTIL = "FINAL" as const;
 
 export function keepDeployFullAccessKey(
   env: Record<string, string | undefined> = process.env,
