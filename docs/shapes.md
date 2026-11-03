@@ -10,5 +10,9 @@ The NEAR contract will only sign these messages (legacy, no ALTs, ≤ 1232 bytes
 | D Distribute | `trust/<id>/raise` | Distributing | ATA create-idempotent + SPL transfer, pro-rata |
 | E Fee split (stretch) | `trust/<id>/fees` | Distributed | 70 / 20 / 10 to addresses fixed at create |
 
-Day-1 crate implements the parser and Shape A (fixed destination + amount cap).
+Day-1 crate implements the parser and Shape A (fixed destination + amount cap;
+fee payer must be the source). The live e2e spike used a **relayer fee payer**
+so the vault dropped by exactly the transfer amount (`docs/spikes.md`). That
+shape is not yet accepted on-chain.
+
 See `contracts/keyless-trust/src/solana` and `src/shapes/transfer.rs`.

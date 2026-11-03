@@ -46,9 +46,6 @@ relayer paid the fee; the vault balance dropped by exactly 1 000 000 lamport
 
 ## Do X, see Y (judge steps)
 
-Placeholders until a testnet contract and funded vaults exist. The day-1 spikes
-already produce real numbers.
-
 1. **Do** `pnpm derive-addresses`. **See** `trust/1/raise` →
    `ed25519:B4paagQ87U6kmpn3AoXYaZMQVsFCJbZtjh8tBoKDDXwj` (plan check) plus
    fees and contributor paths from `v1.signer-prod.testnet`.
@@ -56,13 +53,16 @@ already produce real numbers.
    `sdkMatchesDevnet: true` for `@meteora-ag/dynamic-bonding-curve-sdk@2.0.0`,
    the DBC program executable on devnet, and legacy createConfig2 / create-and-buy
    messages under 1232 bytes (measured 533 and 811).
-3. **Do** `cargo test -p keyless-trust`. **See** 17 tests pass, including the
-   parser rejecting an attacker destination.
-4. **Do** (later) ask the contract to sign a transfer to an attacker address.
-   **See** the NEAR call panic with `transfer destination is not the fixed owner`.
-5. **Do** (later) two wallets chip in, one overpays, execute. **See** capped
-   sweeps, remainder returned, a DBC pool on devnet, pro-rata tokens. A second
-   Trust that misses its deadline refunds to contributors.
+3. **Do** `cargo test -p keyless-trust`. **See** the parser reject an attacker
+   destination (17 unit tests).
+4. **Do** open the Proof links above. **See** a NEAR `sign` and a Solana
+   **devnet** transfer from the keyless vault, with the relayer as fee payer.
+5. **Do** (next PR) ask the deployed contract to sign a transfer to an attacker
+   address. **See** the NEAR call panic with
+   `transfer destination is not the fixed owner`.
+6. **Do** (later) two wallets chip in, one overpays, execute. **See** capped
+   sweeps, a DBC pool on devnet, pro-rata tokens. A second Trust that misses
+   its deadline refunds to contributors.
 
 ## NEAR tech used
 
