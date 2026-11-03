@@ -188,7 +188,7 @@ export async function runNearSignedSolanaTransfer(): Promise<void> {
           ...report,
           submitted: false,
           reason:
-            "Solana submit skipped. Public devnet airdrop is closed; faucet.solana.com needs GitHub auth. Set SOLANA_SUBMIT=1 once the relayer has devnet SOL.",
+            "Solana submit skipped. Set SOLANA_SUBMIT=1 to send the assembled transaction.",
           totalMs: Date.now() - started,
         },
         null,
@@ -243,7 +243,7 @@ if (isMain) {
         {
           skipped: true,
           reason:
-            "Refusing to run: needs a funded NEAR testnet account. Set EXECUTE_NEAR_SIGNED_TRANSFER=1 after exporting the env vars in .env.example. Solana submit additionally needs SOLANA_SUBMIT=1 and relayer SOL.",
+            "Refusing to run: set EXECUTE_NEAR_SIGNED_TRANSFER=1 after exporting the env vars in .env.example. Solana submit additionally needs SOLANA_SUBMIT=1.",
         },
         null,
         2,

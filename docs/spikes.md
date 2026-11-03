@@ -1,6 +1,6 @@
 # Day-1 spikes
 
-Measured 3 Nov 2026 from this repository. Derivation, DBC, and parser spikes are read-only. Spike (d) records three live `sign` calls on NEAR testnet (no Solana submit, no keys in this repo).
+Measured 3 Nov 2026 from this repository. Derivation, DBC, and parser spikes are read-only. Spike (d) is a live NEAR testnet `sign` plus Solana **devnet** submit. No keys in this repo.
 
 ## a) Chain Signatures derivation
 
@@ -43,27 +43,35 @@ Host-side `env::used_gas()` after parse + Shape A check: **264 768 111 gas**
 
 Release wasm: `target/wasm32-unknown-unknown/release/keyless_trust.wasm` **322 671 bytes**.
 
-## d) NEAR-signed Solana transfer
+## d) NEAR-signed Solana transfer (end to end)
 
 Script: `relayer/src/near-signed-solana-transfer.ts`  
-MPC: `v1.signer-prod.testnet` `sign`, `domain_id = 1`, path `trust/1/raise`  
-Payload: 150-byte legacy Solana System transfer (`payload_v2.Eddsa`)
+MPC: `v1.signer-prod.testnet` `sign`, `domain_id = 1`  
+NEAR signer: `keyless-trust-dev-54ef71.testnet`  
+Path: `trust/1/raise` → vault `6HubCQ3zgHX2mDFgKmPvfVXw1mKUmygkQnyD8S1CLYg`  
+Relayer fee payer: `BNxpiYoGLU3XRBgZhVu3tToLYJqSvoNo7kaSkKn26FYV`  
+Amount: **0.001 SOL** (1 000 000 lamports) each, relayer pays the Solana fee, **30 TGas** attached
 
-Three live **testnet** runs (3 Nov 2026). Each returned a 64-byte Ed25519 signature that verified against the derived vault. Gas burnt **8.84 TGas** per call. Time to signature at NEAR finality **7.1–7.8 s**. The Solana blockhash still had ~110 valid slots, so durable nonces are not needed yet.
+Three live runs (3 Nov 2026). Every run burnt **8.84 TGas**. Time to signature **6.8–7.5 s**, send → confirmed **~2.6 s**, total **~14 s**. The vault balance dropped by **exactly 1 000 000 lamports** each time. Durable nonces are not needed.
 
-| # | NEAR tx | Explorer |
+Vault funding (devnet): [`452rHV4vsvxXjAYKXceyeQYmiavoLfAtBbj14kWi9Xdr6S6NCWbRtN9a6WsCi5NLprEiBSeBXdNLhVQKezo6pr9e`](https://explorer.solana.com/tx/452rHV4vsvxXjAYKXceyeQYmiavoLfAtBbj14kWi9Xdr6S6NCWbRtN9a6WsCi5NLprEiBSeBXdNLhVQKezo6pr9e?cluster=devnet)
+
+| # | NEAR `sign` | Solana transfer |
 | --- | --- | --- |
-| 1 | `HFBcj15d6JogZdi76zXos9oby81hGish1cnEqT6Wu11Z` | [testnet.nearblocks.io](https://testnet.nearblocks.io/txns/HFBcj15d6JogZdi76zXos9oby81hGish1cnEqT6Wu11Z) |
-| 2 | `4Jg6pszySeJu6qTzpLRzjgPGhST7eqGDNE237rovUHYa` | [testnet.nearblocks.io](https://testnet.nearblocks.io/txns/4Jg6pszySeJu6qTzpLRzjgPGhST7eqGDNE237rovUHYa) |
-| 3 | `GCd1Hd7sQF1R8YMmnSW3ph2zpgDWc1qE9sf1gkEePCGn` | [testnet.nearblocks.io](https://testnet.nearblocks.io/txns/GCd1Hd7sQF1R8YMmnSW3ph2zpgDWc1qE9sf1gkEePCGn) |
+| 1 | [`BnwGYCZTcZ41ntCUKEeRMmpwhXeuqxzRfyunSvJfDa4R`](https://testnet.nearblocks.io/txns/BnwGYCZTcZ41ntCUKEeRMmpwhXeuqxzRfyunSvJfDa4R) | [`32cEnng3…Ngbd9G`](https://explorer.solana.com/tx/32cEnng3NKyCv2VLQ47M2uXnVDp1LZH7B7rtWZtzHDP2QHz6yrEbFJw7kyWerMs1CYZ2vMoa3cgrcKmKkGNgbd9G?cluster=devnet) |
+| 2 | [`J368XK8TPVruwmy2a1a8UP5bBXKBjZMmLtwi3UKXW1eX`](https://testnet.nearblocks.io/txns/J368XK8TPVruwmy2a1a8UP5bBXKBjZMmLtwi3UKXW1eX) | [`2wBCwpDi…jVTMza`](https://explorer.solana.com/tx/2wBCwpDikerJ7WiYNu4pRGkyP2QTD5EvHg6mFgnvyw2Q291M72Lpj542ZXnAcxewghaGo14cEg6KHiRZKjtVTMza?cluster=devnet) |
+| 3 | [`ARkmp9KQfJuoyjqWaKQbopSELQtRkW1vQ9nGj3ko2tGo`](https://testnet.nearblocks.io/txns/ARkmp9KQfJuoyjqWaKQbopSELQtRkW1vQ9nGj3ko2tGo) | [`2UwjXHH8…XEPWr8A`](https://explorer.solana.com/tx/2UwjXHH8ochhUvGhnDx7pSYDwJWUBdsLkav6yEShNXjqWNqMafUTqvU8fu23QEUKWErME8bqY42cvQoU9XEPWr8A?cluster=devnet) |
 
-The script now uses a **local relayer keypair as Solana fee payer** (vault still signs the transfer) and attaches `DEFAULT_MPC_SIGN_TGAS = 30` (override `MPC_SIGN_TGAS`). CI never runs the MPC call (`EXECUTE_NEAR_SIGNED_TRANSFER` unset → `{ skipped: true }`).
+Full Solana signatures:
 
-**Solana devnet submit is still pending.** The public RPC airdrop is closed and `faucet.solana.com` needs GitHub auth. Set `SOLANA_SUBMIT=1` only after the relayer has devnet SOL.
+- `32cEnng3NKyCv2VLQ47M2uXnVDp1LZH7B7rtWZtzHDP2QHz6yrEbFJw7kyWerMs1CYZ2vMoa3cgrcKmKkGNgbd9G`
+- `2wBCwpDikerJ7WiYNu4pRGkyP2QTD5EvHg6mFgnvyw2Q291M72Lpj542ZXnAcxewghaGo14cEg6KHiRZKjtVTMza`
+- `2UwjXHH8ochhUvGhnDx7pSYDwJWUBdsLkav6yEShNXjqWNqMafUTqvU8fu23QEUKWErME8bqY42cvQoU9XEPWr8A`
+
+The script uses a **local relayer keypair as Solana fee payer** (vault still signs the transfer) and attaches `DEFAULT_MPC_SIGN_TGAS = 30`. CI never runs the MPC call (`EXECUTE_NEAR_SIGNED_TRANSFER` unset → `{ skipped: true }`).
 
 ## Still needs funded testnet / devnet accounts
 
-- A human-created NEAR testnet account to deploy `keyless-trust` (this environment must not create or fund one)
-- Devnet SOL for the relayer fee payer (and transfer amount on the vault). Public airdrop is closed; faucet needs GitHub auth.
+- A human-created NEAR testnet account to **deploy** `keyless-trust` (the e2e `sign` used `keyless-trust-dev-54ef71.testnet` as predecessor, not a deployed contract)
 - A paid or created DBC **config** (createConfig2) that this Trust pins; dummy keys cannot initialise a pool
 - Landing create-and-buy, sweeps, refunds, and a near-workspaces gas trace

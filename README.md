@@ -32,11 +32,17 @@ pnpm dbc-tx-size               # builds txs, does not send
 pnpm dev:app                   # placeholder Trust room (Ethics Launch tokens)
 ```
 
-The MPC transfer script is `relayer/src/near-signed-solana-transfer.ts`. Three
-live `sign` calls already landed on NEAR testnet (see `docs/spikes.md`). Do not
-run it here unless you set `EXECUTE_NEAR_SIGNED_TRANSFER=1`. Solana submit
-additionally needs `SOLANA_SUBMIT=1` and relayer SOL — the public devnet
-airdrop is closed.
+The MPC transfer script is `relayer/src/near-signed-solana-transfer.ts`. Do not
+run it here unless you set `EXECUTE_NEAR_SIGNED_TRANSFER=1` (and `SOLANA_SUBMIT=1`
+to send). Measured numbers: `docs/spikes.md`.
+
+## Proof it works
+
+A NEAR-owned Solana vault signed a 0.001 SOL transfer on **devnet**. The
+relayer paid the fee; the vault balance dropped by exactly 1 000 000 lamports.
+
+- NEAR `sign`: [BnwGYCZTcZ41ntCUKEeRMmpwhXeuqxzRfyunSvJfDa4R](https://testnet.nearblocks.io/txns/BnwGYCZTcZ41ntCUKEeRMmpwhXeuqxzRfyunSvJfDa4R)
+- Solana transfer: [32cEnng3NKyCv2VLQ47M2uXnVDp1LZH7B7rtWZtzHDP2QHz6yrEbFJw7kyWerMs1CYZ2vMoa3cgrcKmKkGNgbd9G](https://explorer.solana.com/tx/32cEnng3NKyCv2VLQ47M2uXnVDp1LZH7B7rtWZtzHDP2QHz6yrEbFJw7kyWerMs1CYZ2vMoa3cgrcKmKkGNgbd9G?cluster=devnet)
 
 ## Do X, see Y (judge steps)
 
