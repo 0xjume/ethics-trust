@@ -117,7 +117,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 
 ### 3.3 Shape B — Capped sweep (deposit → raise vault, remainder → owner)
 - Signer: `in/<pubkey>`. Instructions exactly: `Transfer(deposit → raise_vault, x)` then optional `Transfer(deposit → <pubkey>, rest)`.
-- **Cap**: `x ≤ cap_lamports − swept[pubkey]`, where `cap = target × cap_bps / 10_000` (default 100 bps = 1% of target) and `Σ swept ≤ target`. The contract does **not** debit `swept` on `sign`. It locks a pending row keyed by `sha256(message)` and only books on `confirm_transfer` after Solana lands. A second sign of the same kind is blocked while that lock is live. After ~150s (past the Solana blockhash lifetime) anyone may `release_pending` so a never-sent / expired tx can be re-signed; a late confirm of that hash books only if the remaining budget covers it and the Solana sig is new.
+- **Cap**: `x ≤ cap_lamports − swept[pubkey]`, where `cap = target × cap_bps / 10_000` (default 100 bps = 1% of target) and `Σ swept ≤ target`. The contract does **not** debit `swept` on `sign`. It locks a pending row keyed by `sha256(message)` and only books on `confirm_transfer` after Solana lands. A second sign of the same kind is blocked while that lock is live. After ~150s (past the Solana blockhash lifetime) anyone may `release_pending` so a never-sent / expired tx can be re-signed. A later sign of the same lock increments a per-lock nonce and marks earlier released rows superseded (`pending superseded`). An honest late confirm with no re-sign still books.
 - Overpayment never enters the raise: the remainder goes back in the same tx.
 - Allowed only in state `Executing`.
 
