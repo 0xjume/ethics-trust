@@ -117,7 +117,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 
 ### 3.3 Shape B — Capped sweep (deposit → raise vault, remainder → owner)
 - Signer: `in/<pubkey>`. Instructions exactly: `Transfer(deposit → raise_vault, x)` then optional `Transfer(deposit → <pubkey>, rest)`.
-- **Cap**: `x ≤ cap_lamports − swept[pubkey]`, where `cap = target × cap_bps / 10_000` (default 100 bps = 1% of target) and `Σ swept ≤ target`. The contract records `swept[pubkey] += x` *when it signs*, counting signed-but-unlanded sweeps as spent (conservative). A failed sweep can be re-signed only for the **same** `x` once the watcher reports the blockhash expired and the balance unchanged; with durable nonces this is unnecessary.
+- **Cap**: `x ≤ cap_lamports − swept[pubkey]`, where `cap = target × cap_bps / 10_000` (default 100 bps = 1% of target) and `Σ swept ≤ target`. The contract does **not** debit `swept` on `sign`. It locks a pending row keyed by `sha256(message)` and only books on `confirm_transfer` after Solana lands. A second sign of the same kind is blocked while that lock is live. After ~90s anyone may `release_pending` so a never-sent / expired tx can be re-signed; the original hash stays confirmable if it actually landed.
 - Overpayment never enters the raise: the remainder goes back in the same tx.
 - Allowed only in state `Executing`.
 
