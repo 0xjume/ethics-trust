@@ -42,7 +42,7 @@ Live decode (same script): 37 219 `PoolConfig` accounts and 96 819 `VirtualP
 Host-side `env::used_gas()` after parse + Shape A check: **264 768 111 gas** (~0.26 TGas; `parser_gas_estimate_tgas=0` because the mock reports less than 1 TGas). This is the near-sdk mock runtime, not wasm / near-workspaces. A sandbox gas trace still needs a funded or local near-sandbox binary.
 
 Release wasm (day-1): `target/wasm32-unknown-unknown/release/keyless_trust.wasm` **322 671 bytes**.
-Milestone 2 wasm (this PR, unoptimised): **446 359 bytes**. `wasm-opt -Oz`: **243 040 bytes**. Live run of the previous build used **~221 KB**.
+Milestone 2 wasm (this PR, unoptimised): **456 826 bytes**. `wasm-opt -Oz`: **249 221 bytes**. Live run of the previous build used **~221 KB**.
 
 ## d) NEAR-signed Solana transfer (end to end)
 
@@ -111,8 +111,42 @@ missing; source must match the stored deposit (or raise vault for
 Redeploy after this fix with `scripts/build-wasm.sh` + `pnpm deploy-testnet`
 (storage deposit ≥ 5.5 NEAR, wasm-opt -Oz). Wait for `raise_address` /
 `deposit_address` before sweep/refund, then `confirm_transfer` after Solana
-lands. `release_pending` after ~90s unlocks a re-sign; the original hash
-stays stored so a late confirm still books a landing.
+lands. `release_pending` after ~150s (past the Solana blockhash lifetime)
+unlocks a re-sign; a late confirm of the released hash still books only if
+the budget is free and the Solana sig is new.
+
+### Milestone 2 live rerun (`b20adfe` on m3)
+
+Contract: **`m3.keyless-trust-dev-54ef71.testnet`**. Every flow and must-fail
+check passed. Gas **~14.1 TGas** per sign call.
+
+| Action | Link |
+| --- | --- |
+| Sweep | [3DGKcmod…LPK9fv](https://explorer.solana.com/tx/3DGKcmodF7JFURqz5Cnta3DBUicFCCYj26yxWWvcH6wmeeiidLHXdgfRM1X2g7Twiz8tBkD1j4VNqQ3c27LPK9fv?cluster=devnet) |
+| Raise refund | [Fq8EWk3g…LePjKr](https://explorer.solana.com/tx/Fq8EWk3ge3Wy9HxvKDraDSZVQPypC92BC3fRZrNC9KpucLXBqKHFXpQqq7jfjBvVpk9VJcDGqKsE6pGApLePjKr?cluster=devnet) |
+| B1 now rejected | [Zkw4EyQv…Mc8W4TY](https://testnet.nearblocks.io/txns/Zkw4EyQvaoBQAxVTUdG3ELX4NoyYX8SYzuecMc8W4TY) |
+
+**N1 (found and fixed):** a released pending could be confirmed after a re-sign
+had already settled the same budget, double-booking (`refunded=10M` against
+`overflow=5M`):
+[DjhtE5ZURR7ksn3urEgSv4LbZF65AgCEqXY8iTVHVPjh](https://testnet.nearblocks.io/txns/DjhtE5ZURR7ksn3urEgSv4LbZF65AgCEqXY8iTVHVPjh)
+(released hash `220b0699…`, reused the re-sign's Solana sig). Fix: confirmed
+`solana_sig`s go in the seen set; a released confirm must fit the remaining
+budget; `PENDING_EXPIRY` is **150 s** so release is past the Solana blockhash
+lifetime (~150 slots / 60–90 s). Settled rows are pruned (hash kept in
+`consumed_hashes`).
+
+**N2 (found and fixed):** in Refunding, `refundable` ignored a pending
+unconfirmed sweep, so a refund and a sweep of the same lamports could both
+be signed. Pending sweeps (and refunds) now reduce the other view.
+
+**N3 (found and fixed):** `register` took 1 yocto and settled pendings were
+never pruned. `register` now requires **0.005 NEAR** (`register_deposit`);
+sign requests require **0.001 NEAR** (`sign_deposit`); excess is refunded.
+Settled pendings are pruned.
+
+Deploy no longer leaves the parent's full-access key on the contract.
+`DEPLOY_KEEP_KEY=1` restores the old behaviour.
 
 ### Deploy script
 
@@ -120,12 +154,13 @@ stays stored so a late confirm still books a landing.
 scripts/build-wasm.sh
 NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
 NEAR_PRIVATE_KEY=ed25519:... \
-DEPLOY_SUBACCOUNT=m2 \
+DEPLOY_SUBACCOUNT=m4 \
 EXECUTE_DEPLOY=1 \
 pnpm deploy-testnet
-# → m2.keyless-trust-dev-54ef71.testnet
+# → m4.keyless-trust-dev-54ef71.testnet
 # wrapper: scripts/deploy-testnet.sh
 # DEPLOY_NEAR overrides the computed floor (5.5)
+# DEPLOY_KEEP_KEY=1 leaves a full-access key (off by default)
 ```
 
 ## Still needs funded testnet / devnet accounts

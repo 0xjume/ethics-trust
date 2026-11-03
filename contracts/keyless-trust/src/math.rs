@@ -75,7 +75,10 @@ pub fn raise_refundable_lamports(state: &TrustState, swept: u64, raise_refunded:
     }
 }
 
-pub const PENDING_EXPIRY_NS: u64 = 90 * 1_000_000_000;
+/// Solana `recent_blockhash` lives ~150 slots (≈60–90 s). 150 s is past
+/// that window, so a pending that can be `release_pending`'d can no
+/// longer land on Solana. A late honest confirm (no re-sign) still books.
+pub const PENDING_EXPIRY_NS: u64 = 150 * 1_000_000_000;
 
 /// Sweep only after the raise is filled. Never more than credited − swept,
 /// so a wallet cannot push more than 1% of target into the raise vault.
@@ -173,6 +176,12 @@ mod tests {
     fn raise_refund_only_in_refunding() {
         assert_eq!(raise_refundable_lamports(&TrustState::Executing, 10, 0), 0);
         assert_eq!(raise_refundable_lamports(&TrustState::Refunding, 10, 3), 7);
+    }
+
+    #[test]
+    fn pending_expiry_outlives_solana_blockhash() {
+        assert_eq!(PENDING_EXPIRY_NS, 150 * 1_000_000_000);
+        assert!(PENDING_EXPIRY_NS > 90 * 1_000_000_000);
     }
 
     #[test]

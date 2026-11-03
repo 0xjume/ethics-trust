@@ -34,6 +34,13 @@ const STORAGE_PREFIX_LEDGER: &[u8] = b"c";
 const STORAGE_PREFIX_SIGS: &[u8] = b"s";
 const STORAGE_PREFIX_PENDING: &[u8] = b"p";
 const STORAGE_PREFIX_LOCKS: &[u8] = b"k";
+const STORAGE_PREFIX_CONSUMED: &[u8] = b"h";
+
+/// Covers the contribution row plus the later `derived_public_key` callback
+/// write (~deposit address). Excess is refunded.
+pub const REGISTER_DEPOSIT: NearToken = NearToken::from_millinear(5);
+/// Covers the pending row + lock written on sign. Excess is refunded.
+pub const SIGN_DEPOSIT: NearToken = NearToken::from_millinear(1);
 
 #[near(serializers = [json, borsh])]
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -193,6 +200,7 @@ pub struct Contract {
     seen_sigs: LookupMap<String, u64>,
     pending: LookupMap<String, PendingTransfer>,
     locks: LookupMap<String, String>,
+    consumed_hashes: LookupMap<String, u64>,
 }
 
 fn ledger_key(trust_id: u64, contributor: &str) -> String {
@@ -236,6 +244,7 @@ impl Contract {
             seen_sigs: LookupMap::new(STORAGE_PREFIX_SIGS),
             pending: LookupMap::new(STORAGE_PREFIX_PENDING),
             locks: LookupMap::new(STORAGE_PREFIX_LOCKS),
+            consumed_hashes: LookupMap::new(STORAGE_PREFIX_CONSUMED),
         }
     }
 
@@ -360,12 +369,14 @@ impl Contract {
     }
 
     /// Anyone may register any Solana pubkey. Refunds can only go to that pubkey.
+    /// Attach `register_deposit` (covers the row + derive callback); excess is refunded.
     #[payable]
     pub fn register(&mut self, trust_id: u64, solana_pubkey: String) -> String {
         require!(
-            env::attached_deposit() >= NearToken::from_yoctonear(1),
-            "attach 1 yoctoNEAR"
+            env::attached_deposit() >= REGISTER_DEPOSIT,
+            "insufficient storage deposit"
         );
+        let before = self.storage_snapshot();
         require!(self.trusts.contains_key(&trust_id), "unknown trust");
         let _ = require_pubkey(&solana_pubkey);
         let row = self.ensure_contribution(trust_id, &solana_pubkey);
@@ -373,6 +384,7 @@ impl Contract {
             let _ = self.kick_derive(trust_id, "in", Some(solana_pubkey.clone()));
         }
         let path = row.deposit_path;
+        self.charge_storage(before, REGISTER_DEPOSIT);
         env::log_str(&format!(
             "EVENT_JSON:{{\"standard\":\"keyless-trust\",\"version\":\"0.2.0\",\"event\":\"registered\",\"data\":[{{\"trust_id\":{trust_id},\"path\":\"{path}\"}}]}}"
         ));
@@ -487,7 +499,8 @@ impl Contract {
                 row.swept_lamports,
                 row.refunded_lamports,
             )
-            .saturating_sub(self.pending_amount(trust_id, &contributor, "refund")),
+            .saturating_sub(self.pending_amount(trust_id, &contributor, "refund"))
+            .saturating_sub(self.pending_amount(trust_id, &contributor, "sweep")),
             None => 0,
         }
     }
@@ -514,13 +527,30 @@ impl Contract {
         let trust = self.trusts.get(&trust_id).expect("unknown trust");
         match self.ledger.get(&ledger_key(trust_id, &contributor)) {
             Some(row) => sweepable_lamports(&trust.state, row.credited_lamports, row.swept_lamports)
-                .saturating_sub(self.pending_amount(trust_id, &contributor, "sweep")),
+                .saturating_sub(self.pending_amount(trust_id, &contributor, "sweep"))
+                .saturating_sub(self.pending_amount(trust_id, &contributor, "refund")),
             None => 0,
         }
     }
 
     pub fn get_pending(&self, message_hash: String) -> Option<PendingTransfer> {
         self.pending.get(&message_hash).cloned()
+    }
+
+    pub fn is_consumed(&self, message_hash: String) -> bool {
+        self.consumed_hashes.get(&message_hash).is_some()
+    }
+
+    pub fn register_deposit(&self) -> NearToken {
+        REGISTER_DEPOSIT
+    }
+
+    pub fn sign_deposit(&self) -> NearToken {
+        SIGN_DEPOSIT
+    }
+
+    pub fn pending_expiry_ns(&self) -> u64 {
+        PENDING_EXPIRY_NS
     }
 
     /// Ask the MPC signer for the derived Ed25519 key of a Trust path.
@@ -553,7 +583,11 @@ impl Contract {
         contributor: String,
         message: Base64VecU8,
     ) -> Promise {
-        require!(env::attached_deposit() >= ONE_YOCTO, "attach 1 yoctoNEAR");
+        require!(
+            env::attached_deposit() >= SIGN_DEPOSIT,
+            "insufficient storage deposit"
+        );
+        let before = self.storage_snapshot();
         self.apply_timeouts(trust_id);
         let dest = self.raise_dest(trust_id);
         let max = self.sweepable(trust_id, contributor.clone());
@@ -561,6 +595,7 @@ impl Contract {
         let source = self.require_deposit_source(trust_id, &contributor);
         let checked = self.check_transfer(&message.0, dest, max, source, true);
         self.lock_pending(trust_id, &contributor, "sweep", checked.lamports, &message.0);
+        self.charge_storage(before, SIGN_DEPOSIT);
         if let Some(trust) = self.trusts.get_mut(&trust_id) {
             if trust.state == TrustState::Filled {
                 trust.state = TrustState::Executing;
@@ -587,7 +622,11 @@ impl Contract {
         contributor: String,
         message: Base64VecU8,
     ) -> Promise {
-        require!(env::attached_deposit() >= ONE_YOCTO, "attach 1 yoctoNEAR");
+        require!(
+            env::attached_deposit() >= SIGN_DEPOSIT,
+            "insufficient storage deposit"
+        );
+        let before = self.storage_snapshot();
         self.apply_timeouts(trust_id);
         let dest = require_pubkey(&contributor);
         let max = self.refundable(trust_id, contributor.clone());
@@ -595,6 +634,7 @@ impl Contract {
         let source = self.require_deposit_source(trust_id, &contributor);
         let checked = self.check_transfer(&message.0, dest, max, source, true);
         self.lock_pending(trust_id, &contributor, "refund", checked.lamports, &message.0);
+        self.charge_storage(before, SIGN_DEPOSIT);
         self.sign_vault_tx(
             contributor_path(trust_id, &contributor),
             trust_id,
@@ -614,7 +654,11 @@ impl Contract {
         contributor: String,
         message: Base64VecU8,
     ) -> Promise {
-        require!(env::attached_deposit() >= ONE_YOCTO, "attach 1 yoctoNEAR");
+        require!(
+            env::attached_deposit() >= SIGN_DEPOSIT,
+            "insufficient storage deposit"
+        );
+        let before = self.storage_snapshot();
         self.apply_timeouts(trust_id);
         let dest = require_pubkey(&contributor);
         let max = self.raise_refundable(trust_id, contributor.clone());
@@ -628,6 +672,7 @@ impl Contract {
             checked.lamports,
             &message.0,
         );
+        self.charge_storage(before, SIGN_DEPOSIT);
         let path = self
             .trusts
             .get(&trust_id)
@@ -653,6 +698,14 @@ impl Contract {
             solana_sig.len() >= 64 && solana_sig.len() <= 128,
             "solana_sig looks invalid"
         );
+        require!(
+            self.consumed_hashes.get(&message_hash).is_none(),
+            "pending already settled"
+        );
+        require!(
+            self.seen_sigs.get(&solana_sig).is_none(),
+            "solana_sig already used"
+        );
         let pending = self
             .pending
             .get(&message_hash)
@@ -669,12 +722,24 @@ impl Contract {
             env::predecessor_account_id() == watcher,
             "only the trusted watcher can confirm transfers"
         );
+        if pending.released {
+            let remaining = self.remaining_budget(
+                pending.trust_id,
+                &pending.contributor,
+                &pending.kind,
+            );
+            require!(
+                pending.lamports <= remaining,
+                "amount exceeds remaining budget"
+            );
+        }
         self.settle_pending(&pending, &solana_sig);
     }
 
     /// Anyone may release an expired, unsettled pending so the balance can
-    /// be signed again (~90s, covering ~150 Solana slots). The row stays
-    /// so `confirm_transfer` can still settle the original hash if it landed.
+    /// be signed again (~150s, past the Solana blockhash lifetime). The row
+    /// stays so a late `confirm_transfer` can still book if no re-sign ate
+    /// the budget. Settled rows are pruned.
     pub fn release_pending(&mut self, message_hash: String) {
         let mut pending = self
             .pending
@@ -898,6 +963,15 @@ impl Contract {
             .insert(lock_key(trust_id, contributor, kind), message_hash);
     }
 
+    fn remaining_budget(&self, trust_id: u64, contributor: &str, kind: &str) -> u64 {
+        match kind {
+            "sweep" => self.sweepable(trust_id, contributor.to_string()),
+            "refund" => self.refundable(trust_id, contributor.to_string()),
+            "raise_refund" => self.raise_refundable(trust_id, contributor.to_string()),
+            _ => 0,
+        }
+    }
+
     fn settle_pending(&mut self, pending: &PendingTransfer, solana_sig: &str) {
         let key = ledger_key(pending.trust_id, &pending.contributor);
         let row = self.ledger.get_mut(&key).expect("unknown contributor");
@@ -911,11 +985,40 @@ impl Contract {
             _ => env::panic_str("unknown pending kind"),
         }
         row.last_solana_sig = solana_sig.to_string();
-        let mut settled = pending.clone();
-        settled.settled = true;
-        self.pending
-            .insert(pending.message_hash.clone(), settled);
+        self.seen_sigs
+            .insert(solana_sig.to_string(), pending.trust_id);
+        self.consumed_hashes
+            .insert(pending.message_hash.clone(), pending.trust_id);
+        self.pending.remove(&pending.message_hash);
         self.clear_lock(pending);
+    }
+
+    fn flush_store(&mut self) {
+        self.trusts.flush();
+        self.ledger.flush();
+        self.seen_sigs.flush();
+        self.pending.flush();
+        self.locks.flush();
+        self.consumed_hashes.flush();
+    }
+
+    fn storage_snapshot(&mut self) -> u64 {
+        self.flush_store();
+        env::storage_usage()
+    }
+
+    fn charge_storage(&mut self, before: u64, min_deposit: NearToken) {
+        self.flush_store();
+        let used = env::storage_usage().saturating_sub(before) as u128;
+        let measured = used.saturating_mul(env::storage_byte_cost().as_yoctonear());
+        let required = measured.max(min_deposit.as_yoctonear());
+        let attached = env::attached_deposit().as_yoctonear();
+        require!(attached >= required, "insufficient storage deposit");
+        let refund = attached.saturating_sub(required);
+        if refund > 0 {
+            let _ = Promise::new(env::predecessor_account_id())
+                .transfer(NearToken::from_yoctonear(refund));
+        }
     }
 
     fn clear_lock(&mut self, pending: &PendingTransfer) {
@@ -999,6 +1102,7 @@ mod tests {
     const SIG_B: &str = "2wBCwpDikerJ7WiYNu4pRGkyP2QTD5EvHg6mFgnvyw2Q291M72Lpj542ZXnAcxewghaGo14cEg6KHiRZKjtVTMza";
     const SIG_C: &str = "2UwjXHH8ochhUvGhnDx7pSYDwJWUBdsLkav6yEShNXjqWNqMafUTqvU8fu23QEUKWErME8bqY42cvQoU9XEPWr8A";
     const SIG_D: &str = "452rHV4vsvxXjAYKXceyeQYmiavoLfAtBbj14kWi9Xdr6S6NCWbRtN9a6WsCi5NLprEiBSeBXdNLhVQKezo6pr9e";
+    const PAID: NearToken = NearToken::from_millinear(10);
 
     fn context(predecessor: AccountId, deposit: NearToken) -> VMContextBuilder {
         let mut b = VMContextBuilder::new();
@@ -1161,7 +1265,7 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         let path = c.register(id, DEMO_PUBKEY.into());
         assert_eq!(path, format!("trust/1/in/{DEMO_PUBKEY}"));
         seed_deposit(&mut c, id);
@@ -1180,7 +1284,7 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         let row = c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
         assert_eq!(row.credited_lamports, 10);
         assert_eq!(row.overflow_lamports, 40);
@@ -1194,7 +1298,7 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Filled);
         assert_eq!(c.sweepable(id, DEMO_PUBKEY.into()), 10);
@@ -1206,7 +1310,7 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 2_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 5, SIG_A.into());
         testing_env!(context_at(accounts(2), NearToken::from_yoctonear(0), 3_000).build());
         assert_eq!(c.try_timeout(id), TrustState::Refunding);
@@ -1218,7 +1322,7 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 50_000);
-        testing_env!(context_at(accounts(2), ONE_YOCTO, 1_000).build());
+        testing_env!(context_at(accounts(2), PAID, 1_000).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Filled);
         testing_env!(context_at(accounts(2), NearToken::from_yoctonear(0), 2_500).build());
@@ -1232,12 +1336,12 @@ mod tests {
         let mut cfg = demo_config(1_000, 9_000);
         cfg.watcher = accounts(3);
         let id = c.create_trust(cfg);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             c.report_deposit(id, DEMO_PUBKEY.into(), 1, SIG_A.into());
         }));
         assert!(panicked.is_err());
-        testing_env!(context(accounts(3), ONE_YOCTO).build());
+        testing_env!(context(accounts(3), PAID).build());
         let row = c.report_deposit(id, DEMO_PUBKEY.into(), 1, SIG_B.into());
         assert_eq!(row.credited_lamports, 1);
     }
@@ -1247,7 +1351,7 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 1, SIG_A.into());
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             c.report_deposit(id, DEMO_PUBKEY.into(), 1, SIG_A.into());
@@ -1261,12 +1365,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
         seed_deposit(&mut c, id);
         let attacker = [9u8; 32];
         let bytes = transfer_bytes(deposit_bytes(), attacker, 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
 
@@ -1276,12 +1380,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), [9u8; 32], 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
 
@@ -1290,12 +1394,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Executing);
         assert_eq!(
@@ -1306,7 +1410,7 @@ mod tests {
         );
         assert_eq!(c.sweepable(id, DEMO_PUBKEY.into()), 0);
         let hash = message_hash(&bytes);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.confirm_transfer(hash, SIG_D.into());
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
@@ -1321,11 +1425,11 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 40);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
@@ -1333,7 +1437,7 @@ mod tests {
                 .refunded_lamports,
             0
         );
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.confirm_transfer(message_hash(&bytes), SIG_D.into());
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
@@ -1351,11 +1455,11 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
 
@@ -1364,7 +1468,7 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         c.report_deposit(id, DEMO_PUBKEY.into(), 7, SIG_B.into());
         let row = c.get_contribution(id, DEMO_PUBKEY.into()).unwrap();
@@ -1379,12 +1483,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_C.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         let hash = message_hash(&bytes);
         assert!(c.get_pending(hash.clone()).is_some());
@@ -1412,10 +1516,10 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 40);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
 
@@ -1425,12 +1529,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
         seed_deposit(&mut c, id);
         let fee_payer = [8u8; 32];
         let bytes = relayer_paid_bytes(fee_payer, fee_payer, owner_bytes(), 40);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
 
@@ -1440,12 +1544,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_trust(&mut c, 1_000, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 50, SIG_A.into());
         seed_deposit(&mut c, id);
         let other = bs58::decode_pubkey(OTHER_VAULT).unwrap();
         let bytes = relayer_paid_bytes([8u8; 32], other, owner_bytes(), 40);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
 
@@ -1455,13 +1559,13 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let first = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 6);
         let second = relayer_paid_bytes([7u8; 32], deposit_bytes(), raise_bytes(), 4);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(first));
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(second));
     }
@@ -1471,12 +1575,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         let hash = message_hash(&bytes);
         testing_env!(context_at(
@@ -1498,12 +1602,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         c.release_pending(message_hash(&bytes));
     }
@@ -1513,22 +1617,22 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 2_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let sweep = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(sweep.clone()));
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.confirm_transfer(message_hash(&sweep), SIG_B.into());
         testing_env!(context_at(accounts(2), NearToken::from_yoctonear(0), 3_000).build());
         assert_eq!(c.try_timeout(id), TrustState::Refunding);
         assert_eq!(c.raise_refundable(id, DEMO_PUBKEY.into()), 10);
         let refund = relayer_paid_bytes([8u8; 32], raise_bytes(), owner_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_raise_refund(id, DEMO_PUBKEY.into(), Base64VecU8(refund.clone()));
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.confirm_transfer(message_hash(&refund), SIG_C.into());
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
@@ -1544,23 +1648,23 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         let hash = message_hash(&bytes);
         testing_env!(context_at(
             accounts(2),
-            ONE_YOCTO,
+            PAID,
             1_000 + PENDING_EXPIRY_NS + 1
         )
         .build());
         c.confirm_transfer(hash.clone(), SIG_D.into());
-        let pending = c.get_pending(hash).unwrap();
-        assert!(pending.settled);
+        assert!(c.get_pending(hash.clone()).is_none());
+        assert!(c.is_consumed(hash));
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
                 .unwrap()
@@ -1574,12 +1678,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         let hash = message_hash(&bytes);
         testing_env!(context_at(
@@ -1589,7 +1693,7 @@ mod tests {
         )
         .build());
         c.release_pending(hash.clone());
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.confirm_transfer(hash, SIG_D.into());
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
@@ -1605,17 +1709,17 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let first = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(first));
         let second = relayer_paid_bytes([7u8; 32], deposit_bytes(), raise_bytes(), 10);
         testing_env!(context_at(
             accounts(1),
-            ONE_YOCTO,
+            PAID,
             1_000 + PENDING_EXPIRY_NS + 1
         )
         .build());
@@ -1627,16 +1731,16 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         c.report_deposit(id, DEMO_PUBKEY.into(), 7, SIG_B.into());
         seed_deposit(&mut c, id);
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Filled);
         assert_eq!(c.refundable(id, DEMO_PUBKEY.into()), 7);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 7);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.confirm_transfer(message_hash(&bytes), SIG_D.into());
         assert_eq!(
             c.get_contribution(id, DEMO_PUBKEY.into())
@@ -1653,12 +1757,12 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         c.confirm_transfer(message_hash(&bytes), SIG_D.into());
     }
@@ -1669,19 +1773,19 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 2_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let sweep = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(sweep.clone()));
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.confirm_transfer(message_hash(&sweep), SIG_B.into());
         testing_env!(context_at(accounts(2), NearToken::from_yoctonear(0), 3_000).build());
         assert_eq!(c.try_timeout(id), TrustState::Refunding);
         let refund = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_raise_refund(id, DEMO_PUBKEY.into(), Base64VecU8(refund));
     }
 
@@ -1691,11 +1795,11 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
     }
 
@@ -1705,13 +1809,126 @@ mod tests {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
         let id = open_fillable(&mut c, 10, 9_000);
-        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        testing_env!(context(accounts(2), PAID).build());
         c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
         seed_raise(&mut c, id);
         seed_deposit(&mut c, id);
         let fee_payer = [8u8; 32];
         let bytes = relayer_paid_bytes(fee_payer, fee_payer, raise_bytes(), 10);
-        testing_env!(context(accounts(1), ONE_YOCTO).build());
+        testing_env!(context(accounts(1), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes));
+    }
+
+    fn expire_and_release(c: &mut Contract, hash: &str) {
+        testing_env!(context_at(
+            accounts(1),
+            NearToken::from_yoctonear(0),
+            1_000 + PENDING_EXPIRY_NS + 1
+        )
+        .build());
+        c.release_pending(hash.to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "solana_sig already used")]
+    fn resign_then_late_confirm_same_sig_is_rejected() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 10, 9_000);
+        testing_env!(context(accounts(2), PAID).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let first = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), PAID).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(first.clone()));
+        let first_hash = message_hash(&first);
+        expire_and_release(&mut c, &first_hash);
+        let second = relayer_paid_bytes([7u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), PAID).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(second.clone()));
+        testing_env!(context(accounts(2), PAID).build());
+        c.confirm_transfer(message_hash(&second), SIG_D.into());
+        c.confirm_transfer(first_hash, SIG_D.into());
+    }
+
+    #[test]
+    #[should_panic(expected = "amount exceeds remaining budget")]
+    fn late_confirm_released_over_budget_is_rejected() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 10, 9_000);
+        testing_env!(context(accounts(2), PAID).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let first = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), PAID).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(first.clone()));
+        let first_hash = message_hash(&first);
+        expire_and_release(&mut c, &first_hash);
+        let second = relayer_paid_bytes([7u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), PAID).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(second.clone()));
+        testing_env!(context(accounts(2), PAID).build());
+        c.confirm_transfer(message_hash(&second), SIG_D.into());
+        c.confirm_transfer(first_hash, SIG_C.into());
+    }
+
+    #[test]
+    fn honest_late_confirm_without_resign_still_books() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 10, 9_000);
+        testing_env!(context(accounts(2), PAID).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let bytes = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), PAID).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
+        let hash = message_hash(&bytes);
+        expire_and_release(&mut c, &hash);
+        testing_env!(context(accounts(2), PAID).build());
+        c.confirm_transfer(hash.clone(), SIG_D.into());
+        assert!(c.is_consumed(hash));
+        assert_eq!(
+            c.get_contribution(id, DEMO_PUBKEY.into())
+                .unwrap()
+                .swept_lamports,
+            10
+        );
+        assert_eq!(c.pending_expiry_ns(), PENDING_EXPIRY_NS);
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing to refund")]
+    fn refunding_cannot_refund_while_sweep_pending() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 10, 2_000);
+        testing_env!(context(accounts(2), PAID).build());
+        c.report_deposit(id, DEMO_PUBKEY.into(), 10, SIG_A.into());
+        seed_raise(&mut c, id);
+        seed_deposit(&mut c, id);
+        let sweep = relayer_paid_bytes([8u8; 32], deposit_bytes(), raise_bytes(), 10);
+        testing_env!(context(accounts(1), PAID).build());
+        let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(sweep));
+        testing_env!(context_at(accounts(2), NearToken::from_yoctonear(0), 3_000).build());
+        assert_eq!(c.try_timeout(id), TrustState::Refunding);
+        assert_eq!(c.refundable(id, DEMO_PUBKEY.into()), 0);
+        let refund = relayer_paid_bytes([8u8; 32], deposit_bytes(), owner_bytes(), 10);
+        testing_env!(context(accounts(1), PAID).build());
+        let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(refund));
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient storage deposit")]
+    fn register_rejects_insufficient_deposit() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_trust(&mut c, 1_000, 9_000);
+        testing_env!(context(accounts(2), ONE_YOCTO).build());
+        let _ = c.register(id, DEMO_PUBKEY.into());
     }
 }
