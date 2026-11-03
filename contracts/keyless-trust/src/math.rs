@@ -49,8 +49,9 @@ pub fn split_deposit(
     }
 }
 
-/// Raising: uncredited overflow only. Refunding: credited + overflow − swept.
-/// Already-refunded lamports are subtracted. Other states: nothing.
+/// Overflow is never part of the raise, so it is refundable in Raising,
+/// Filled and Executing. Refunding: credited + overflow − swept.
+/// Launched: nothing. Already-refunded lamports are subtracted.
 pub fn refundable_lamports(
     state: &TrustState,
     credited: u64,
@@ -59,12 +60,22 @@ pub fn refundable_lamports(
     refunded: u64,
 ) -> u64 {
     let eligible = match state {
-        TrustState::Raising => overflow,
+        TrustState::Raising | TrustState::Filled | TrustState::Executing => overflow,
         TrustState::Refunding => credited.saturating_add(overflow).saturating_sub(swept),
-        TrustState::Filled | TrustState::Executing | TrustState::Launched => 0,
+        TrustState::Launched => 0,
     };
     eligible.saturating_sub(refunded)
 }
+
+/// Swept SOL sitting in the raise vault, refundable only in Refunding.
+pub fn raise_refundable_lamports(state: &TrustState, swept: u64, raise_refunded: u64) -> u64 {
+    match state {
+        TrustState::Refunding => swept.saturating_sub(raise_refunded),
+        _ => 0,
+    }
+}
+
+pub const PENDING_EXPIRY_NS: u64 = 90 * 1_000_000_000;
 
 /// Sweep only after the raise is filled. Never more than credited − swept,
 /// so a wallet cannot push more than 1% of target into the raise vault.
@@ -152,9 +163,16 @@ mod tests {
     }
 
     #[test]
-    fn filled_and_executing_are_not_refundable() {
-        assert_eq!(refundable_lamports(&TrustState::Filled, 10, 5, 0, 0), 0);
-        assert_eq!(refundable_lamports(&TrustState::Executing, 10, 5, 0, 0), 0);
+    fn filled_and_executing_refund_overflow_only() {
+        assert_eq!(refundable_lamports(&TrustState::Filled, 10, 5, 0, 0), 5);
+        assert_eq!(refundable_lamports(&TrustState::Executing, 10, 5, 0, 2), 3);
+        assert_eq!(refundable_lamports(&TrustState::Launched, 10, 5, 0, 0), 0);
+    }
+
+    #[test]
+    fn raise_refund_only_in_refunding() {
+        assert_eq!(raise_refundable_lamports(&TrustState::Executing, 10, 0), 0);
+        assert_eq!(raise_refundable_lamports(&TrustState::Refunding, 10, 3), 7);
     }
 
     #[test]

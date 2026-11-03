@@ -3,6 +3,9 @@
  *
  * The contract view returns path `trust/<id>/in/<pubkey>` plus the MPC inputs.
  * This script calls `v1.signer-prod.testnet.derived_public_key` (domain 1).
+ * After `create_trust` / `register` the contract stores the same key via
+ * an MPC callback — wait until `get_trust.raise_address` and
+ * `get_contribution.deposit_address` are set before sweep/refund.
  * Read-only. No keys, no spend.
  *
  * Env:

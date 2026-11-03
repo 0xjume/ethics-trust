@@ -42,7 +42,7 @@ Live decode (same script): 37 219 `PoolConfig` accounts and 96 819 `VirtualP
 Host-side `env::used_gas()` after parse + Shape A check: **264 768 111 gas** (~0.26 TGas; `parser_gas_estimate_tgas=0` because the mock reports less than 1 TGas). This is the near-sdk mock runtime, not wasm / near-workspaces. A sandbox gas trace still needs a funded or local near-sandbox binary.
 
 Release wasm (day-1): `target/wasm32-unknown-unknown/release/keyless_trust.wasm` **322 671 bytes**.
-Milestone 2 wasm: **405 499 bytes** (parser + ledger + sweep/refund).
+Milestone 2 wasm (this PR, unoptimised): **445 777 bytes**. `wasm-opt -Oz`: **242 647 bytes**. Live run of the previous build used **~221 KB**.
 
 ## d) NEAR-signed Solana transfer (end to end)
 
@@ -87,14 +87,36 @@ near-workspaces is **not** a default-CI dep (no near-sandbox download). The
 practical MPC mock is the unit-test callbacks. See
 `contracts/keyless-trust/tests/sandbox.rs` for the later workspaces recipe.
 
-### Live deploy (blocked in this environment)
+### Milestone 2 live run
 
-This agent has **no** `NEAR_*` / `SOLANA_*` credentials. The e2e `sign` from
-spike (d) used `keyless-trust-dev-54ef71.testnet` as a predecessor, not a
-deployed contract. Exact deploy (testnet only):
+Contract: **`m2.keyless-trust-dev-54ef71.testnet`** (NEARtestnet). Sweep, overflow
+refund, and tampered-destination rejection all worked. Gas **~13.8 TGas** per
+sign call (**8.18 TGas** of it MPC), **~8 s** to signature, **~4 s** to confirm.
+
+| Action | Link |
+| --- | --- |
+| Sweep | [51DxJTpR…8zaRcg](https://explorer.solana.com/tx/51DxJTpRZFyVPgndpeJ4DkK9PhZt5pJuQazqNzhuGbiEdHhLecVnZSgwHvHSejvYmWU3zhJKJoBHt3kYsw8zaRcg?cluster=devnet) |
+| Overflow refund | [5wGFPo3e…oyfJtn](https://explorer.solana.com/tx/5wGFPo3erHFEU7sfMC8eYDUEvphyvjbkee93Lfr8Hxz2HjUFt4DQ3JsFH2L8JHiWecpUSEntxPpCicWU3CoyfJtn?cluster=devnet) |
+| Tampered dest rejected | [6vDKJvPH…uik4t](https://testnet.nearblocks.io/txns/6vDKJvPHEoHn9qZNzvx5CmX6gdFn6SfsJ5CscY9uik4t) |
+
+**B1 (found and fixed):** transfer source was not enforced because
+`deposit_address` was never stored. A refund whose source was the relayer
+wallet was accepted and 0.001 SOL was booked as refunded while the SOL stayed
+in the deposit address:
+[4jqRrYokTwtB3gDDkGKeJvu3WCtaBi4YyxFSmckYx6ez](https://testnet.nearblocks.io/txns/4jqRrYokTwtB3gDDkGKeJvu3WCtaBi4YyxFSmckYx6ez).
+Fix: derive+store deposit / raise / fee keys via MPC callback; reject if
+missing; source must match the stored deposit (or raise vault for
+`request_raise_refund`).
+
+Redeploy after this fix with `scripts/build-wasm.sh` + `pnpm deploy-testnet`
+(storage deposit ≥ 5.5 NEAR, wasm-opt -Oz). Wait for `raise_address` /
+`deposit_address` before sweep/refund, then `confirm_transfer` after Solana
+lands.
+
+### Deploy script
 
 ```bash
-cargo build -p keyless-trust --target wasm32-unknown-unknown --release
+scripts/build-wasm.sh
 NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
 NEAR_PRIVATE_KEY=ed25519:... \
 DEPLOY_SUBACCOUNT=m2 \
@@ -102,15 +124,8 @@ EXECUTE_DEPLOY=1 \
 pnpm deploy-testnet
 # → m2.keyless-trust-dev-54ef71.testnet
 # wrapper: scripts/deploy-testnet.sh
+# DEPLOY_NEAR overrides the computed floor (5.5)
 ```
-
-Paste the resulting NEAR tx here once a human runs it:
-
-- deploy `new`: _(pending — no creds in the agent env)_
-
-After deploy, `CONTRACT_ID=m2.keyless-trust-dev-54ef71.testnet pnpm deposit-address`
-should match the same derived Solana address as a raw `derived_public_key` call
-with predecessor = that contract id.
 
 ## Still needs funded testnet / devnet accounts
 
