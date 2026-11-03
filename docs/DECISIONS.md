@@ -58,11 +58,11 @@ Meteora BUILD rules that still apply: `@solana/web3.js` v1 only (not `@solana/ki
 
 Day-1 audit against `.agents/skills/near-contract-audit`: callbacks are `#[private]`; `request_refund` / `request_sweep` / `register` / `report_deposit` / `confirm_transfer` take 1 yoctoNEAR; unique map prefixes `t` (trusts), `c` (ledger), `s` (seen sigs), `p` (pending), `k` (locks); `#[init]` + `PanicOnDefault`; no `Default` impl that skips init.
 
-Milestone 2 (post live test): `create_trust(config)` **requires a watcher** and kicks off `derived_public_key` for `trust/<id>/raise` and `/fees`. `register` / first `report_deposit` derive `trust/<id>/in/<pubkey>` and store `deposit_address`. Sweep/refund **reject** if that address is missing; the transfer source must match it (B1). The ledger is not debited on `sign`: a pending row keyed by `sha256(message)` is locked until the watcher calls `confirm_transfer(message_hash, solana_sig)` or anyone calls `release_pending` after ~90s (B2). Overflow is refundable in Raising, Filled and Executing. Swept SOL is refundable from the raise vault in Refunding (`request_raise_refund`).
+Milestone 2 (post live test): `create_trust(config)` **requires a watcher** and kicks off `derived_public_key` for `trust/<id>/raise` and `/fees`. `register` / first `report_deposit` derive `trust/<id>/in/<pubkey>` and store `deposit_address`. Sweep/refund **reject** if that address is missing; the transfer source must match it (B1). The ledger is not debited on `sign`: a pending row keyed by `sha256(message)` is locked until the watcher calls `confirm_transfer(message_hash, solana_sig)`. After ~90s anyone may `release_pending` so a never-sent / expired tx can be re-signed; the original hash stays stored and confirmable if it landed (B2). Overflow is refundable in Raising, Filled and Executing. Swept SOL is refundable from the raise vault in Refunding (`request_raise_refund`).
 
 **Watcher trust assumption:** NEAR cannot see Solana. The watcher can delay a raise, under/over-report deposits among real contributors, and delay `confirm_transfer`. It cannot change destinations: every signed transfer source and dest is a stored derived key or the contributor's own pubkey. Anyone can run a second watcher to audit reports against explorers. This is the PLAN §4 trust point, restated after R1.
 
-**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): this PR is **242 647 bytes** after -Oz (445 777 before). The previous live deploy measured ~221 KB.
+**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): this PR is **243 040 bytes** after -Oz (446 359 before). The previous live deploy measured ~221 KB.
 
 ## MPC `sign` gas and Solana fee payer (3 Nov 2026)
 
@@ -79,7 +79,7 @@ Explorer links: `docs/spikes.md`.
 | No durable nonce | Sign 6.8–7.5 s, send→confirmed ~2.6 s, total ~14 s. The blockhash stayed valid. |
 | Devnet submit **works** | Three confirmed transfers. CI still refuses to call `sign` or submit unless `EXECUTE_NEAR_SIGNED_TRANSFER=1` (and `SOLANA_SUBMIT=1` for send). |
 
-The on-chain Shape A checker still requires fee-payer = source (refunds). The e2e spike and later vault spends that must keep an exact balance use the relayer-paid shape instead.
+On-chain Shapes A / A2 / B accept a relayer fee payer and **require** the stored vault as transfer source. Vault-paid (fee payer = source) still passes.
 
 ## Networks
 

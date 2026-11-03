@@ -42,7 +42,7 @@ Live decode (same script): 37 219 `PoolConfig` accounts and 96 819 `VirtualP
 Host-side `env::used_gas()` after parse + Shape A check: **264 768 111 gas** (~0.26 TGas; `parser_gas_estimate_tgas=0` because the mock reports less than 1 TGas). This is the near-sdk mock runtime, not wasm / near-workspaces. A sandbox gas trace still needs a funded or local near-sandbox binary.
 
 Release wasm (day-1): `target/wasm32-unknown-unknown/release/keyless_trust.wasm` **322 671 bytes**.
-Milestone 2 wasm (this PR, unoptimised): **445 777 bytes**. `wasm-opt -Oz`: **242 647 bytes**. Live run of the previous build used **~221 KB**.
+Milestone 2 wasm (this PR, unoptimised): **446 359 bytes**. `wasm-opt -Oz`: **243 040 bytes**. Live run of the previous build used **~221 KB**.
 
 ## d) NEAR-signed Solana transfer (end to end)
 
@@ -111,7 +111,8 @@ missing; source must match the stored deposit (or raise vault for
 Redeploy after this fix with `scripts/build-wasm.sh` + `pnpm deploy-testnet`
 (storage deposit ≥ 5.5 NEAR, wasm-opt -Oz). Wait for `raise_address` /
 `deposit_address` before sweep/refund, then `confirm_transfer` after Solana
-lands.
+lands. `release_pending` after ~90s unlocks a re-sign; the original hash
+stays stored so a late confirm still books a landing.
 
 ### Deploy script
 

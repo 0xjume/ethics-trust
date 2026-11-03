@@ -48,7 +48,7 @@ impl ShapeError {
             Self::ExtraInstruction => "extra instruction beyond the allowed transfer shape",
             Self::NotSystemTransfer => "instruction is not SystemProgram::Transfer",
             Self::WrongDestination => "transfer destination is not the fixed owner",
-            Self::WrongSource => "transfer source is not the derived deposit address",
+            Self::WrongSource => "transfer source is not the required vault",
             Self::AmountAboveCap => "transfer amount exceeds the signed cap",
             Self::MissingAccounts => "transfer is missing from/to accounts",
             Self::FeePayerNotSource => "fee payer must be the vault being spent",
