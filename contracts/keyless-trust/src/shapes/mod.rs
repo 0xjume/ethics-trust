@@ -1,4 +1,4 @@
-//! Allowed Solana transaction shapes. Day-1 spike: System transfer only.
+//! Allowed Solana transaction shapes. Milestone 2: System transfer (A/B).
 
 pub mod transfer;
 

@@ -5,11 +5,13 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "test": "node --import tsx --test src/derive-addresses.test.ts src/legacy-message.test.ts src/verify-dbc-sdk.test.ts src/near-signed-solana-transfer.test.ts",
+    "test": "node --import tsx --test src/derive-addresses.test.ts src/legacy-message.test.ts src/verify-dbc-sdk.test.ts src/near-signed-solana-transfer.test.ts src/deposit-address.test.ts src/deploy-testnet.test.ts src/watcher.test.ts",
     "derive-addresses": "tsx src/derive-addresses.ts",
+    "deposit-address": "tsx src/deposit-address.ts",
     "dbc-tx-size": "tsx src/dbc-tx-size.ts",
     "verify-dbc-sdk": "tsx src/verify-dbc-sdk.ts",
-    "near-signed-transfer": "tsx src/near-signed-solana-transfer.ts"
+    "near-signed-transfer": "tsx src/near-signed-solana-transfer.ts",
+    "deploy-testnet": "tsx src/deploy-testnet.ts"
   },
   "dependencies": {
     "@meteora-ag/cp-amm-sdk": "1.5.1",

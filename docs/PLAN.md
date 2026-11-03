@@ -1,6 +1,6 @@
 # Keyless Trust: build plan (NEAR HACKATHON, track `memecoins`)
 
-Status: research plan plus day-1 scaffold (this repo). No funded accounts, deploys, or spend. SDK pins and spike numbers: `docs/DECISIONS.md`, `docs/spikes.md`.
+Status: research plan plus day-1 scaffold and milestone-2 chip-in / refund / sweep. No funded accounts or spend in the agent env; deploy script is documented. SDK pins and spike numbers: `docs/DECISIONS.md`, `docs/spikes.md`.
 Prepared 3 Nov 2026 (WIB). Scope chosen by Jume: Track A only, a separate hackathon entry, testnet and devnet only, submitted before 15 Nov 2026 06:59 WIB.
 
 > One line: community token raises on Solana where no person or server holds the vaults. A NEAR contract controls every vault through Chain Signatures and will only ever sign five transaction shapes: refund, capped sweep, Meteora DBC create-and-buy, pro-rata distribution, and (stretch) the 70/20/10 fee split.
@@ -107,7 +107,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 
 **Fee payer** = account key 0. Two allowed modes:
 - the vault being spent (it pays its own 5,000-lamport fee; contract caps priority fee as above), or
-- a relayer key that co-signs (lets USDC-only deposits move without SOL). The relayer key must not be writable in any instruction except as fee payer. MVP: SOL-only, vault pays.
+- a relayer key that co-signs (lets the vault balance stay exact). The relayer key must not be writable in any instruction except as fee payer. Milestone 2 default: relayer pays; vault-paid still allowed.
 
 **Blockhash**: NEAR cannot check freshness, and does not need to: a stale blockhash only makes the tx fail. The real danger is *double execution* when the same intent is signed twice with two blockhashes. Each shape is therefore designed so that a second landing either fails or does nothing harmful (see per-shape notes). If day-1 latency (MPC sign ~2–3 s documented, plus NEAR finality) approaches the ~60–90 s blockhash lifetime, switch to a **durable nonce** per vault: message's first instruction is `AdvanceNonceAccount(nonce_acct, authority = vault)`, contract checks it, and a signed message then never expires, so the relayer can retry forever without re-signing.
 
@@ -117,7 +117,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 
 ### 3.3 Shape B — Capped sweep (deposit → raise vault, remainder → owner)
 - Signer: `in/<pubkey>`. Instructions exactly: `Transfer(deposit → raise_vault, x)` then optional `Transfer(deposit → <pubkey>, rest)`.
-- **Cap**: `x ≤ cap_lamports − swept[pubkey]`, where `cap = target × cap_bps / 10_000` (default 100 bps = 1% of target) and `Σ swept ≤ target`. The contract records `swept[pubkey] += x` *when it signs*, counting signed-but-unlanded sweeps as spent (conservative). A failed sweep can be re-signed only for the **same** `x` once the watcher reports the blockhash expired and the balance unchanged; with durable nonces this is unnecessary.
+- **Cap**: `x ≤ cap_lamports − swept[pubkey]`, where `cap = target × cap_bps / 10_000` (default 100 bps = 1% of target) and `Σ swept ≤ target`. The contract does **not** debit `swept` on `sign`. It locks a pending row keyed by `sha256(message)` and only books on `confirm_transfer` after Solana lands. A second sign of the same kind is blocked while that lock is live. After ~150s (past the Solana blockhash lifetime) anyone may `release_pending` so a never-sent / expired tx can be re-signed. A later sign of the same lock increments a per-lock nonce and marks earlier released rows superseded (`pending superseded`). An honest late confirm with no re-sign still books.
 - Overpayment never enters the raise: the remainder goes back in the same tx.
 - Allowed only in state `Executing`.
 
@@ -140,7 +140,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 ## 4. Trust assumptions (to state plainly in the README)
 
 - **MPC network**: Chain Signatures nodes collectively could sign anything; this is the base assumption of the whole NEAR stack.
-- **Watcher/relayer**: NEAR cannot read Solana. The watcher reports deposit balances, landed sweeps, the post-buy token amount and expiry. A lying or offline watcher can **delay** everything and can **skew the pro-rata split among real registered contributors** (e.g. understate one sweep), but cannot send funds to any address the contract did not fix (owner, raise vault, DBC pool, contributors, fixed fee destinations). Anyone can run a watcher; refunds after the deadline are permissionless.
+- **Watcher/relayer**: NEAR cannot read Solana. A watcher **must** be set at `create_trust`. It reports deposit balances, confirms landed sweeps/refunds (`confirm_transfer`), and the post-buy token amount. A lying or offline watcher can **delay** everything and can **skew the pro-rata split among real registered contributors** (e.g. understate one sweep), but cannot send funds to any address the contract did not derive (owner, raise vault, DBC pool, contributors, fixed fee destinations). Anyone can run a second watcher to audit. Refunds after the deadline are permissionless except that `confirm_transfer` still needs the named watcher.
 - Mitigations: multiple watchers with "first to report, others can dispute within N minutes" (stretch); every report is logged on NEAR so anyone can audit against Solana explorers; optional future: Solana light-client or ZK proofs of account state.
 - **Sybil**: the 1% cap is per *wallet*; one person can split into many wallets. Good enough for a demo, not a fairness guarantee. Say so.
 - **DBC config**: created once by a normal keypair with `createConfig2`; once created it cannot be changed, and the Trust pins its pubkey. `feeClaimer` and `leftoverReceiver` are set to the fee vault so no human receives partner fees.
@@ -151,14 +151,17 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
             create_trust
                  │
                  ▼
-   ┌──────────► Open ──(deadline passed, Σ reported < target)──► Refunding ──► Closed
-   │             │                                                   ▲
-   │  (Σ reported deposits ≥ target, before deadline)               │
-   │             ▼                                                   │
-   │         Executing ──(24 h execution timeout, not Launched)──────┘
-   │             │  sweeps (B) → create-and-buy (C)
+   ┌──────────► Raising ──(deadline passed, Σ credited < target)──► Refunding
+   │             │
+   │  (Σ credited ≥ target, before deadline)
    │             ▼
-   │          Launched ──► Distributing (D) ──► Distributed ──(stretch) fee split (E), repeatable
+   │          Filled ──(24 h execution timeout)────────────────────► Refunding
+   │             │ first sweep
+   │             ▼
+   │         Executing ──(24 h from start, not Launched)───────────► Refunding
+   │             │  sweeps (B) → create-and-buy (C)   [next milestone]
+   │             ▼
+   │          Launched ──► pro-rata (D) ── (stretch) fee split (E)
 ```
 - Defaults (Ethics patterns, re-implemented): cap 1% of target per wallet, deadline set at creation, 24 h execution timeout, 1.5% fill fee to the fee vault (taken from the raise before the buy; MVP may set 0), fee split 70/20/10.
 - `Refunding`: any caller can request Shape A for any registered deposit; also covers deposits that arrive late.
