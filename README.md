@@ -47,9 +47,6 @@ relayer paid the fee; the vault balance dropped by exactly 1 000 000 lamport
 
 ## Do X, see Y (judge steps)
 
-Placeholders until a testnet contract and funded vaults exist. The day-1 spikes
-already produce real numbers.
-
 1. **Do** `pnpm derive-addresses`. **See** `trust/1/raise` →
    `ed25519:B4paagQ87U6kmpn3AoXYaZMQVsFCJbZtjh8tBoKDDXwj` (plan check) plus
    fees and contributor paths from `v1.signer-prod.testnet`.

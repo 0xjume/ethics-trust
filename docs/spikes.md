@@ -157,6 +157,31 @@ left leftover budget (nearblocks `AMDGKAuV…`). Sign with exactly
 `sign_deposit()` 0.001 NEAR failed (`56VuXGAR…`, needed ~0.0043). Both
 closed in this commit. Redeploy as **m5**.
 
+### Milestone 2 live rerun (`6514056` on m5)
+
+Contract: **`m5.keyless-trust-dev-54ef71.testnet`**. Deployed
+[B2aH2JZi…](https://testnet.nearblocks.io/txns/B2aH2JZixb5ujV79yK5Xb5Uoj4pPBbgNMGydyjhkwBgU)
+(5.5 NEAR, no full-access key; RPC `view_access_key_list` is empty). Storage
+**258.05 kB**. 47 transactions.
+
+N4 deposits work on-chain: `register` **0.005 NEAR** and sign requests
+**0.01 NEAR**. Late confirms of already-settled or reused-sig hashes fail.
+A leftover-budget late confirm is rejected (`amount exceeds remaining budget`).
+
+| Action | Link |
+| --- | --- |
+| Deploy (FINAL, keyless) | [B2aH2JZi…](https://testnet.nearblocks.io/txns/B2aH2JZixb5ujV79yK5Xb5Uoj4pPBbgNMGydyjhkwBgU) |
+| `register` 0.005 | [7JQGFrAU…](https://testnet.nearblocks.io/txns/7JQGFrAU4QU8LSfEh9AwBqLA8671LY2jqzbRQKJC9oLN) |
+| Sweep sign 0.01 | [CS3Pf5Sv…](https://testnet.nearblocks.io/txns/CS3Pf5SvMxcaMzQYdWHb5UYENehnArupcxbRNoAxVPgK) |
+| Refund sign 0.01 | [8XNzWdq9…](https://testnet.nearblocks.io/txns/8XNzWdq92cbKSQzqLhb2tdiB6N29cAD8YGuVJqxAbhWH) |
+| Confirm landed | [2VomgvdQ…](https://testnet.nearblocks.io/txns/2VomgvdQbRV18ESP7E97QU6R48bsUuyyR9c5AWMKHuxH) · Solana [48xKqVuC…](https://explorer.solana.com/tx/48xKqVuCsQ1uxsaRyVDFFj5bXfvYkhV94RnirT2oqeWGwctqZJ1mkPPCA5Bi5zdC72iPSqofjPAXooJfhHmfeRP8?cluster=devnet) |
+| Confirm after release | [FfdcXicq…](https://testnet.nearblocks.io/txns/FfdcXicqrhuqJudrQcwZf915kbSmQP7uNhZ5HH31eph6) · Solana [C39F8Yxx…](https://explorer.solana.com/tx/C39F8Yxxqtnfqx2YYc1nSsnKYB3LGgMc7gZiSRM7RaPAw49GREmJpBfhK8VtcZeVMCGTUyv1mdZegNVG28rhBhb?cluster=devnet) |
+| Must-fail: already settled | [6cXB4Mp2…](https://testnet.nearblocks.io/txns/6cXB4Mp2mjC8xgBLpfTv3kY69VFywiHEwxN5Pwwysjnb) |
+| Must-fail: sig reused | [F4FV1Kqx…](https://testnet.nearblocks.io/txns/F4FV1Kqx1QLh4Qidt5T919H1EH5kevhjgJZYF8K8yf7w) |
+| Must-fail: leftover budget | [AMPQ9RrR…](https://testnet.nearblocks.io/txns/AMPQ9RrRPeCzRitaTuCpNpxyUJjQ6XG4j1WLcxQvEQLT) |
+
+Account: [m5.keyless-trust-dev-54ef71.testnet](https://testnet.nearblocks.io/address/m5.keyless-trust-dev-54ef71.testnet).
+
 ### Deploy script
 
 ```bash
