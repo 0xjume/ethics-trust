@@ -27,6 +27,7 @@ pnpm install
 cargo test --workspace
 pnpm test
 pnpm derive-addresses          # read-only NEAR testnet view
+pnpm deposit-address           # path trust/<id>/in/<pubkey> → Solana address
 pnpm verify-dbc-sdk            # read-only Solana devnet
 pnpm dbc-tx-size               # builds txs, does not send
 pnpm dev:app                   # placeholder Trust room (Ethics Launch tokens)
@@ -56,13 +57,16 @@ already produce real numbers.
    `sdkMatchesDevnet: true` for `@meteora-ag/dynamic-bonding-curve-sdk@2.0.0`,
    the DBC program executable on devnet, and legacy createConfig2 / create-and-buy
    messages under 1232 bytes (measured 533 and 811).
-3. **Do** `cargo test -p keyless-trust`. **See** 17 tests pass, including the
-   parser rejecting an attacker destination.
-4. **Do** (later) ask the contract to sign a transfer to an attacker address.
-   **See** the NEAR call panic with `transfer destination is not the fixed owner`.
-5. **Do** (later) two wallets chip in, one overpays, execute. **See** capped
-   sweeps, remainder returned, a DBC pool on devnet, pro-rata tokens. A second
-   Trust that misses its deadline refunds to contributors.
+3. **Do** `cargo test -p keyless-trust`. **See** the parser and ledger reject
+   an attacker destination, cap overflow, and refund-while-raising of credited
+   funds.
+4. **Do** open the Proof links above. **See** a NEAR `sign` and a Solana
+   **devnet** transfer from the keyless vault, with the relayer as fee payer.
+5. **Do** `pnpm deposit-address`. **See** `trust/1/in/<pubkey>` plus the
+   `v1.signer-prod.testnet` derived Solana address (domain 1).
+6. **Do** (later, DBC launch) two wallets chip in, one overpays, execute.
+   **See** capped sweeps, a DBC pool on devnet, pro-rata tokens. A second Trust
+   that misses its deadline refunds to contributors.
 
 ## NEAR tech used
 
