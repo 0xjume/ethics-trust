@@ -37,6 +37,14 @@ pub enum ShapeError {
     FeePayerNotSource,
     SourceNotSigner,
     DestinationNotWritable,
+    WrongConfig,
+    WrongMint,
+    WrongParams,
+    WrongBuyAmount,
+    WrongFillFee,
+    MissingLaunchIx,
+    WrongAccount,
+    WrongWrap,
 }
 
 impl ShapeError {
@@ -54,6 +62,14 @@ impl ShapeError {
             Self::FeePayerNotSource => "fee payer must be the vault being spent",
             Self::SourceNotSigner => "transfer source is not a required signer",
             Self::DestinationNotWritable => "transfer destination is not writable",
+            Self::WrongConfig => "DBC config is not the pubkey pinned at create_trust",
+            Self::WrongMint => "base mint is not the derived trust/<id>/mint key",
+            Self::WrongParams => "name/symbol/uri do not match the trust config",
+            Self::WrongBuyAmount => "first-buy amount_in is not raise total minus fill fee",
+            Self::WrongFillFee => "fill fee transfer is missing or not raise → fee vault",
+            Self::MissingLaunchIx => "launch message needs initialize_virtual_pool + swap",
+            Self::WrongAccount => "launch instruction account does not match the derived pin",
+            Self::WrongWrap => "wSOL wrap must be raise → raise WSOL ATA for the first-buy amount, then SyncNative",
         }
     }
 }

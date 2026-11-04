@@ -18,6 +18,7 @@ const CONTRIBUTOR =
 const PATHS = [
   `trust/${TRUST_ID}/raise`,
   `trust/${TRUST_ID}/fees`,
+  `trust/${TRUST_ID}/mint`,
   `trust/${TRUST_ID}/in/${CONTRIBUTOR}`,
 ];
 

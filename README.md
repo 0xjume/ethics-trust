@@ -5,9 +5,10 @@ Community token raises whose Solana vaults no person or server holds.
 A NEAR contract owns every Trust vault (per-contributor deposit, raise vault,
 fee vault) through NEAR Chain Signatures (Ed25519, `domain_id` 1,
 `v1.signer-prod.testnet`) and will only sign allowed Solana transaction shapes:
-refund to the contributor, a capped 1% sweep into the raise vault, a Meteora
-DBC create-and-buy into the pinned config, pro-rata token distribution, and
-(stretch) a 70/20/10 fee split.
+refund to the contributor, a capped sweep (`cap_bps` required at create), a
+Meteora DBC create-and-buy into the pinned config (relayer pays pool/ATA
+rent; every launch account is derived and pinned), pro-rata token
+distribution, and (stretch) a 70/20/10 fee split.
 
 NEAR HACKATHON 2026 · track `memecoins` · **testnet and Solana devnet only**.
 
@@ -60,9 +61,9 @@ relayer paid the fee; the vault balance dropped by exactly 1 000 000 lamport
    **devnet** transfer from the keyless vault, with the relayer as fee payer.
 5. **Do** `pnpm deposit-address`. **See** `trust/1/in/<pubkey>` plus the
    `v1.signer-prod.testnet` derived Solana address (domain 1).
-6. **Do** (later, DBC launch) two wallets chip in, one overpays, execute.
-   **See** capped sweeps, a DBC pool on devnet, pro-rata tokens. A second Trust
-   that misses its deadline refunds to contributors.
+6. **Do** (m6, human live) `pnpm create-dbc-config` then `request_launch`
+   after the sweep settles. **See** a DBC pool on Solana **devnet**,
+   `state = Launched`, `pool_address` set. Pro-rata tokens are Milestone 4.
 
 ## NEAR tech used
 
@@ -88,8 +89,10 @@ vault mechanic. Patterns only; no copied modules.
   **delay** the raise and **skew the pro-rata split among registered
   contributors**. It cannot send funds to any address the contract did not fix
   (owner, raise vault, DBC pool, contributors, fixed fee destinations). Anyone
-  can run a watcher. `confirm_transfer` is watcher-only. Refunds after the
-  deadline are permissionless except that confirm still needs the named watcher.
+  can run a watcher. `confirm_transfer`, `request_launch`, `request_sweep`,
+  and `request_fill_fee` are watcher-only. Refunds stay permissionless
+  (full amount only) so a contributor can exit if the watcher is offline;
+  confirm still needs the named watcher.
 - **Sybil.** The 1% cap is per *wallet*. One person can split into many wallets.
   Good enough for a demo, not a fairness guarantee.
 - **DBC config.** Created once; the Trust pins its pubkey. `feeClaimer` and
