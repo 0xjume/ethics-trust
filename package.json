@@ -24,5 +24,10 @@
     "relay-distribute": "pnpm --filter @keyless-trust/relayer relay-distribute",
     "confirm-distribute": "pnpm --filter @keyless-trust/relayer confirm-distribute",
     "dev:app": "pnpm --filter @keyless-trust/app dev"
+  },
+  "pnpm": {
+    "overrides": {
+      "@solana/web3.js": "1.99.0"
+    }
   }
 }
