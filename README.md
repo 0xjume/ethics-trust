@@ -61,9 +61,13 @@ relayer paid the fee; the vault balance dropped by exactly 1 000 000 lamport
    **devnet** transfer from the keyless vault, with the relayer as fee payer.
 5. **Do** `pnpm deposit-address`. **See** `trust/1/in/<pubkey>` plus the
    `v1.signer-prod.testnet` derived Solana address (domain 1).
-6. **Do** (m6, human live) `pnpm create-dbc-config` then `request_launch`
-   after the sweep settles. **See** a DBC pool on Solana **devnet**,
-   `state = Launched`, `pool_address` set. Pro-rata tokens are Milestone 4.
+6. **Do** (human, testnet + devnet, new subaccount **m10**) the recipe in
+   `docs/spikes.md`. **See** a DBC pool, then a pro-rata `TransferChecked`
+   from the raise token ATA to each contributor's ATA. `claimable` drops
+   only after the watcher `confirm_transfer`, and the trust moves to
+   `Distributed` when every floor share is booked. Rounding dust stays in
+   the raise ATA. The share basis is the contract's first-buy quote, not a
+   watcher balance.
 
 ## NEAR tech used
 
@@ -85,18 +89,28 @@ vault mechanic. Patterns only; no copied modules.
 - **MPC network.** The signer set could collectively sign anything. That is the
   base assumption of Chain Signatures.
 - **Watcher / relayer.** NEAR cannot read Solana. The watcher reports balances,
-  landed sweeps, tokens bought, and expiry. A lying or offline watcher can
-  **delay** the raise and **skew the pro-rata split among registered
-  contributors**. It cannot send funds to any address the contract did not fix
-  (owner, raise vault, DBC pool, contributors, fixed fee destinations). Anyone
-  can run a watcher. `confirm_transfer`, `request_launch`, `request_sweep`,
-  and `request_fill_fee` are watcher-only. Refunds stay permissionless
-  (full amount only) so a contributor can exit if the watcher is offline;
-  confirm still needs the named watcher.
+  landed sweeps, and expiry. A lying or offline watcher can **delay** the
+  raise and can still mis-report **who credited how much** among registered
+  contributors. It cannot set the share basis, and it cannot send funds to
+  any address the contract did not fix (owner, raise vault, DBC pool,
+  contributors, fixed fee destinations). Anyone can run a watcher.
+  `confirm_transfer`, `confirm_launch_outcome`, `request_launch`,
+  `request_sweep`, and `request_fill_fee` are watcher-only. Refunds stay
+  permissionless (full amount only) so a contributor can exit if the watcher
+  is offline; confirm still needs the named watcher. Distribution claims are
+  permissionless. One paid claim locks only the contributors in that message
+  (at most 5) for 150 s. `tokens_bought` is the contract's exact-in quote of
+  `credited − fill fee` on the curve stored at `create_trust`, pinned as the
+  swap's `minimum_amount_out` at `request_launch`. `confirm_launch_outcome`
+  takes no balance. Sum of floor shares is required to be ≤ that basis, so
+  claim order cannot strand a later contributor. Tokens the swap delivers
+  above the quote stay in the raise ATA as dust. Destinations stay the
+  register pubkey.
 - **Sybil.** The 1% cap is per *wallet*. One person can split into many wallets.
   Good enough for a demo, not a fairness guarantee.
-- **DBC config.** Created once; the Trust pins its pubkey. `feeClaimer` and
-  `leftoverReceiver` are the fee vault.
+- **DBC config.** Created once; the Trust pins its pubkey. `feeClaimer` is
+  the fee vault. `leftoverReceiver` is the raise vault. Distribution uses
+  classic Tokenkeg (Shape C rejects Token-2022).
 
 ## Regulatory disclaimer
 

@@ -61,7 +61,7 @@ pub fn refundable_lamports(
     let eligible = match state {
         TrustState::Raising | TrustState::Filled | TrustState::Executing => overflow,
         TrustState::Refunding => credited.saturating_add(overflow).saturating_sub(swept),
-        TrustState::Launched => 0,
+        TrustState::Launched | TrustState::Distributed => 0,
     };
     eligible.saturating_sub(refunded)
 }
@@ -90,14 +90,26 @@ pub fn apply_rent_dust_closeout(eligible: u64, remaining_on_account: u64) -> u64
         return 0;
     }
     let leftover = remaining_on_account.saturating_sub(eligible);
-    if remaining_on_account >= RENT_EXEMPT_MIN
-        && leftover > 0
-        && leftover < RENT_EXEMPT_MIN
-    {
+    if remaining_on_account >= RENT_EXEMPT_MIN && leftover > 0 && leftover < RENT_EXEMPT_MIN {
         remaining_on_account
     } else {
         eligible
     }
+}
+
+/// Raw base units of a 1_000_000_000 supply at 6 decimals (the pinned DBC
+/// curve). The quoted first-buy output cannot exceed this.
+pub const MAX_TOKENS_BOUGHT: u64 = 1_000_000_000 * 1_000_000;
+
+/// `floor(tokens_bought * credited / credited_total)`.
+/// Dust (`tokens_bought − Σ floors`) stays in the raise ATA. It is not a
+/// share and is not claimable. Each floor's remainder is < 1 raw unit, so
+/// dust is strictly less than the number of credited contributors.
+pub fn pro_rata_share(tokens_bought: u64, credited: u64, credited_total: u64) -> u64 {
+    if tokens_bought == 0 || credited == 0 || credited_total == 0 {
+        return 0;
+    }
+    ((tokens_bought as u128) * (credited as u128) / (credited_total as u128)) as u64
 }
 
 /// Sweep only after the raise is filled. Never more than credited − swept,
@@ -163,14 +175,8 @@ mod tests {
 
     #[test]
     fn raising_refunds_overflow_only() {
-        assert_eq!(
-            refundable_lamports(&TrustState::Raising, 10, 40, 0, 0),
-            40
-        );
-        assert_eq!(
-            refundable_lamports(&TrustState::Raising, 10, 40, 0, 15),
-            25
-        );
+        assert_eq!(refundable_lamports(&TrustState::Raising, 10, 40, 0, 0), 40);
+        assert_eq!(refundable_lamports(&TrustState::Raising, 10, 40, 0, 15), 25);
     }
 
     #[test]
@@ -190,6 +196,23 @@ mod tests {
         assert_eq!(refundable_lamports(&TrustState::Filled, 10, 5, 0, 0), 5);
         assert_eq!(refundable_lamports(&TrustState::Executing, 10, 5, 0, 2), 3);
         assert_eq!(refundable_lamports(&TrustState::Launched, 10, 5, 0, 0), 0);
+        assert_eq!(
+            refundable_lamports(&TrustState::Distributed, 10, 5, 0, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn pro_rata_floors_and_leaves_dust() {
+        assert_eq!(pro_rata_share(0, 1, 1), 0);
+        assert_eq!(pro_rata_share(100, 0, 100), 0);
+        assert_eq!(pro_rata_share(1_000, 1, 2), 500);
+        let a = pro_rata_share(100, 1, 3);
+        let b = pro_rata_share(100, 2, 3);
+        assert_eq!(a, 33);
+        assert_eq!(b, 66);
+        assert_eq!(100 - a - b, 1);
+        assert!(pro_rata_share(MAX_TOKENS_BOUGHT, 1, 1) == MAX_TOKENS_BOUGHT);
     }
 
     #[test]

@@ -1,0 +1,114 @@
+{
+  "sdk": "@meteora-ag/dynamic-bonding-curve-sdk@2.0.0",
+  "demoParamsHash": "195cdfa16cdacbff6220f26297c135e9982c90c77693f6db5c8cb6116ff903c6",
+  "curves": [
+    {
+      "name": "demo",
+      "sqrtStartPrice": "32609544831759054",
+      "migrationQuoteThreshold": "10000000000",
+      "collectFeeMode": 0,
+      "enableFirstSwapWithMinFee": true,
+      "baseFeeMode": 0,
+      "cliffFeeNumerator": "10000000",
+      "numberOfPeriod": 0,
+      "reductionFactor": "0",
+      "points": [
+        {
+          "sqrtPrice": "130438178253327822",
+          "liquidity": "34783514296328165318017769454091"
+        }
+      ],
+      "periodFrequency": "0",
+      "quotes": [
+        {
+          "amountIn": "1000000",
+          "outputAmount": "316705933123"
+        },
+        {
+          "amountIn": "985000000",
+          "outputAmount": "241421378472608"
+        },
+        {
+          "amountIn": "2000000000",
+          "outputAmount": "397490584793208"
+        },
+        {
+          "amountIn": "8500000000",
+          "outputAmount": "764023259139526"
+        }
+      ]
+    },
+    {
+      "name": "output-fee",
+      "sqrtStartPrice": "32609544831759054",
+      "migrationQuoteThreshold": "10000000000",
+      "collectFeeMode": 1,
+      "enableFirstSwapWithMinFee": true,
+      "baseFeeMode": 0,
+      "cliffFeeNumerator": "10000000",
+      "numberOfPeriod": 0,
+      "reductionFactor": "0",
+      "points": [
+        {
+          "sqrtPrice": "130438178253327822",
+          "liquidity": "34783514296328165318017769454091"
+        }
+      ],
+      "periodFrequency": "0",
+      "quotes": [
+        {
+          "amountIn": "1000000000",
+          "outputAmount": "243692304297596"
+        }
+      ]
+    },
+    {
+      "name": "decaying-min-fee",
+      "sqrtStartPrice": "32609544831759054",
+      "migrationQuoteThreshold": "10000000000",
+      "collectFeeMode": 0,
+      "enableFirstSwapWithMinFee": true,
+      "baseFeeMode": 0,
+      "cliffFeeNumerator": "50000000",
+      "numberOfPeriod": 4,
+      "reductionFactor": "10000000",
+      "points": [
+        {
+          "sqrtPrice": "130438178253327822",
+          "liquidity": "34783514296328165318017769454091"
+        }
+      ],
+      "periodFrequency": "100",
+      "quotes": [
+        {
+          "amountIn": "1000000000",
+          "outputAmount": "244255971920346"
+        }
+      ]
+    },
+    {
+      "name": "cliff-not-min",
+      "sqrtStartPrice": "32609544831759054",
+      "migrationQuoteThreshold": "10000000000",
+      "collectFeeMode": 0,
+      "enableFirstSwapWithMinFee": false,
+      "baseFeeMode": 0,
+      "cliffFeeNumerator": "50000000",
+      "numberOfPeriod": 4,
+      "reductionFactor": "10000000",
+      "points": [
+        {
+          "sqrtPrice": "130438178253327822",
+          "liquidity": "34783514296328165318017769454091"
+        }
+      ],
+      "periodFrequency": "100",
+      "quotes": [
+        {
+          "amountIn": "1000000000",
+          "outputAmount": "236575872167489"
+        }
+      ]
+    }
+  ]
+}

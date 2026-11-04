@@ -15,6 +15,7 @@ import { NATIVE_MINT } from "@solana/spl-token";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import { demoCurveConfig } from "./dbc-curve.ts";
+import { storedCurveFromConfig } from "./dbc-quote.ts";
 import { deriveTrustAddresses } from "./derive-addresses.ts";
 import { pinParamsHash } from "./launch-math.ts";
 
@@ -76,7 +77,13 @@ export async function runCreateDbcConfig(): Promise<void> {
   const name = process.env.TOKEN_NAME ?? "Keyless";
   const symbol = process.env.TOKEN_SYMBOL ?? "KLT";
   const uri = process.env.TOKEN_URI ?? "https://ethics.ltd/k.json";
-  const paramsHash = await pinParamsHash(config.publicKey.toBase58(), name, symbol, uri);
+  const paramsHash = await pinParamsHash(
+    config.publicKey.toBase58(),
+    name,
+    symbol,
+    uri,
+    storedCurveFromConfig(demoCurveConfig()),
+  );
 
   const report: Record<string, unknown> = {
     ...plan,
