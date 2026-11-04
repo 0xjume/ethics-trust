@@ -2,6 +2,10 @@
 
 NEAR Hackathon 2026, track `memecoins` ("Memecoins With Mechanics"). NEAR testnet and Solana devnet only.
 
+**Live demo: https://trust.ethics.ltd (testnet/devnet)**
+
+The production site is HTTPS on Vercel, on the custom domain above. It reads NEAR testnet and Solana devnet. Fallback: https://keyless-trust.vercel.app.
+
 ## Summary
 
 Keyless Trust is a NEAR contract that runs a community token raise on Solana. The contract owns every Trust's Solana addresses through Chain Signatures: one deposit address per contributor, the raise vault, the fee vault, and the mint. It asks the multi-party computation (MPC) signer `v1.signer-prod.testnet` for an Ed25519 signature (domain id 1). It signs only these transaction shapes: a full refund, a capped sweep, a Meteora Dynamic Bonding Curve (DBC) create-and-buy that uses the in-contract exact-in quote and a 1.5% fill fee, and a pro-rata distribution. No person or server holds a vault key. A relayer pays NEAR gas and the Solana fee. The destination of every signed transfer is an address the contract derived or the contributor pubkey stored at `register`.
@@ -234,11 +238,15 @@ There is no markdown lint job in CI.
 
 ### Web app
 
+The hosted app is live at https://trust.ethics.ltd (custom domain, HTTPS, Vercel). The same deployment is at https://keyless-trust.vercel.app. Both read NEAR testnet and Solana devnet. Trust list, trust detail, and Verify work without a wallet.
+
+To run that app locally:
+
 ```bash
 pnpm dev:app
 ```
 
-Open `http://localhost:3000`. The app reads NEAR testnet and Solana devnet. Trust list, trust detail, and Verify work without a wallet. Create, register, and the action page can submit a wallet transaction on testnet or devnet.
+Open `http://localhost:3000`. Create, register, and the action page can submit a wallet transaction on testnet or devnet.
 
 Environment variables, all public, all optional (defaults are in `app/src/lib/config.ts` and `.env.example`):
 
@@ -301,26 +309,30 @@ Root `package.json` scripts. Read-only or dry-run unless the gate in the last co
 
 ## Try it
 
-`https://trust.ethics.ltd` is coming soon. These steps run on your machine. They read the deployed testnet contract and the transactions already recorded in the repo. They do not require a funded account.
+Start at the live app. It reads the deployed testnet contract. No funded account is required to read it. If https://trust.ethics.ltd does not load, use https://keyless-trust.vercel.app. The same paths work on both hosts.
 
-1. **Do** `pnpm install --frozen-lockfile` and `pnpm dev:app`. **See** the app at `http://localhost:3000`. The footer reads NEAR Hackathon 2026, track `memecoins`, testnet and devnet only.
-2. **Do** open `http://localhost:3000/trusts`. **See** the rows returned by `list_trusts` on `m10.keyless-trust-dev-54ef71.testnet`. No wallet. The page states that "raised" SOL is what the watcher has credited.
-3. **Do** open a trust id from that list, or open `http://localhost:3000/verify` if the list is empty. **See** on Verify: `view_access_key_list` for the contract, MPC signer `v1.signer-prod.testnet`, domain id 1 (Ed25519), paths `trust/1/raise`, `trust/1/fees`, and `trust/1/mint`, plus the two transactions below.
+1. **Do** open https://trust.ethics.ltd. **See** the home page. The footer reads NEAR Hackathon 2026, track `memecoins`, testnet and devnet only.
+2. **Do** open https://trust.ethics.ltd/trusts. **See** the rows returned by `list_trusts` on `m10.keyless-trust-dev-54ef71.testnet`. No wallet. The page states that "raised" SOL is what the watcher has credited.
+3. **Do** open a trust id from that list, or open https://trust.ethics.ltd/verify if the list is empty. **See** on Verify: `view_access_key_list` for the contract, MPC signer `v1.signer-prod.testnet`, domain id 1 (Ed25519), paths `trust/1/raise`, `trust/1/fees`, and `trust/1/mint`, plus the two transactions below.
 4. **Do** open the deploy transaction [DthW5Pdxa6gKYFfLSc9RQSvdff2u2iFXYLPv7zReZnoK](https://testnet.nearblocks.io/txns/DthW5Pdxa6gKYFfLSc9RQSvdff2u2iFXYLPv7zReZnoK) and the devnet launch [HM7k5veL6ivW6L1jZn3JZ6VTyoKNoWFEubm3cKMazxaceKqSSgucXFDvd7vEhd3sfKkLyHhKCVHLu7nZ2MKj7jw](https://explorer.solana.com/tx/HM7k5veL6ivW6L1jZn3JZ6VTyoKNoWFEubm3cKMazxaceKqSSgucXFDvd7vEhd3sfKkLyHhKCVHLu7nZ2MKj7jw?cluster=devnet). **See** the testnet deploy the Verify page links to, and the Meteora DBC create-and-buy signed for the m10 raise vault. The relayer paid the Solana fee.
 5. **Do** `pnpm derive-addresses`. **See** predecessor `example.testnet`, path `trust/1/raise`, key `ed25519:B4paagQ87U6kmpn3AoXYaZMQVsFCJbZtjh8tBoKDDXwj`. The same command prints `trust/1/fees`, `trust/1/mint`, and `trust/1/in/<pubkey>`.
 6. **Do** `cargo test --workspace` and `pnpm test`. **See** the contract tests reject an extra raise transfer, a redirected swap output, ExactOut, a partial refund, `register` after launch, and a `minimum_amount_out` other than the quote.
 7. **Do** `pnpm verify-dbc-sdk` and `pnpm dbc-tx-size`. **See** `sdkMatchesDevnet: true` for `@meteora-ag/dynamic-bonding-curve-sdk@2.0.0`, the DBC program executable on devnet, and legacy messages of 533 bytes (`createConfig2`) and 811 bytes (pool plus first buy). Both are under 1,232 bytes. Neither command sends a transaction.
 
+Local alternative for steps 1 to 3: `pnpm install --frozen-lockfile`, then `pnpm dev:app`, then the same pages at `http://localhost:3000`, `http://localhost:3000/trusts`, and `http://localhost:3000/verify`. The Quick start section has the build and test commands.
+
 A full raise on testnet and devnet (create, sweep, launch, distribute) needs funded accounts and the recipe in `docs/spikes.md` under "Quote basis deploy recipe (m10)". This environment does not run that recipe.
 
 ## Deployed addresses
 
-Only addresses and transaction ids recorded in this repository are listed here.
+Only addresses and transaction ids recorded in this repository are listed here. The web app is hosted on Vercel. Production is the custom domain https://trust.ethics.ltd (HTTPS). It uses NEAR testnet and Solana devnet. https://keyless-trust.vercel.app is the Vercel fallback for the same deployment.
 
 Current app target:
 
 | Role | Value |
 | --- | --- |
+| Web app (production) | https://trust.ethics.ltd |
+| Web app (Vercel fallback) | https://keyless-trust.vercel.app |
 | Contract | `m10.keyless-trust-dev-54ef71.testnet` |
 | Parent account used for deploys | `keyless-trust-dev-54ef71.testnet` |
 | MPC signer | `v1.signer-prod.testnet` |
@@ -344,7 +356,7 @@ Earlier subaccounts with live runs in `docs/spikes.md`: `m2`, `m3`, `m4`, and `m
 
 ## Project links
 
-- Project domain: [https://trust.ethics.ltd](https://trust.ethics.ltd) (coming soon).
+- Live demo: [https://trust.ethics.ltd](https://trust.ethics.ltd) (testnet/devnet). Hosted on Vercel, HTTPS. Fallback: [https://keyless-trust.vercel.app](https://keyless-trust.vercel.app).
 - Ethics, the existing product: [https://ethics.ltd](https://ethics.ltd).
 
 ## Status and roadmap
@@ -355,14 +367,14 @@ Done: milestones 1 to 4 and the web app.
 - Milestone 2: state machine, register, deposit credit, refund, and capped sweep.
 - Milestone 3: DBC create-and-buy shape, with the relayer paying init and ATA rent.
 - Milestone 4: pro-rata distribution, then the in-contract quote as the share basis (the m10 wasm).
-- Web app: home, trust list, trust detail, create, contribute, actions, and Verify, using the Ethics Launch tokens in `packages/ui`.
+- Web app: home, trust list, trust detail, create, contribute, actions, and Verify, using the Ethics Launch tokens in `packages/ui`. Hosted on Vercel at https://trust.ethics.ltd.
 
 Next:
 
 - A watcher and relayer service. The repo has one-shot scripts and a watcher stub that returns no deposits.
 - The 70/20/10 fee split (70% holders distributor, 20% Ethics holders distributor, 10% platform), with destinations fixed at `create_trust`.
 - Moving the web app to `@solana/kit`.
-- Agent access: a Model Context Protocol (MCP) server with `list_trusts`, `get_trust`, `join_trust`, `request_refund`, and claim, plus `llms.txt`, so AI agents can join a Trust with their own NEAR and Solana keys. The server never holds keys.
+- Agent access, not live yet: a Model Context Protocol (MCP) server with `list_trusts`, `get_trust`, `join_trust`, `request_refund`, and claim, plus `llms.txt`, so AI agents can join a Trust with their own NEAR and Solana keys. The server never holds keys. Neither the MCP server nor `llms.txt` is deployed.
 
 The relayer stays on `@solana/web3.js` 1.99.0 because Meteora DBC SDK 2.0.0 requires `^1.98`. The root `package.json` pins that version with a pnpm override. DBC builders use `@solana/web3.js` `Transaction` and `PublicKey`. They do not use `@solana/kit`.
 
