@@ -17,6 +17,7 @@
     "request-launch": "pnpm --filter @keyless-trust/relayer request-launch",
     "relay-launch": "pnpm --filter @keyless-trust/relayer relay-launch",
     "confirm-launch": "pnpm --filter @keyless-trust/relayer confirm-launch",
+    "generate-quote-fixtures": "pnpm --filter @keyless-trust/relayer generate-quote-fixtures",
     "build-distribute-message": "pnpm --filter @keyless-trust/relayer build-distribute-message",
     "request-distribute": "pnpm --filter @keyless-trust/relayer request-distribute",
     "relay-distribute": "pnpm --filter @keyless-trust/relayer relay-distribute",

@@ -6,13 +6,14 @@
 //! Raise vault may wrap buy lamports into its WSOL ATA and optionally
 //! close that ATA back to itself. Swap is the IDL 15-account list
 //! (referral `None` = DBC program id at index 12) plus optional
-//! `Sysvar1nstructions`. ExactIn only; `minimum_amount_out ≥ 1`.
+//! `Sysvar1nstructions`. ExactIn only; `minimum_amount_out` must equal
+//! `LaunchCheck.min_out` (the contract's first-buy quote).
 
 use crate::bs58;
 use crate::pda::{find_program_address, ordered_keys};
+use crate::shapes::transfer::{COMPUTE_BUDGET_PROGRAM, SYSTEM_PROGRAM};
 use crate::solana::error::ShapeError;
 use crate::solana::message::LegacyMessage;
-use crate::shapes::transfer::{COMPUTE_BUDGET_PROGRAM, SYSTEM_PROGRAM};
 
 /// `dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN`
 pub const DBC_PROGRAM: [u8; 32] = [
@@ -45,8 +46,8 @@ pub const ATA_PROGRAM: [u8; 32] = [
 
 /// `metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s`
 pub const METADATA_PROGRAM: [u8; 32] = [
-    11, 112, 101, 177, 227, 209, 124, 69, 56, 157, 82, 127, 107, 4, 195, 205, 88, 184, 108, 115, 26,
-    160, 253, 181, 73, 182, 209, 188, 3, 248, 41, 70,
+    11, 112, 101, 177, 227, 209, 124, 69, 56, 157, 82, 127, 107, 4, 195, 205, 88, 184, 108, 115,
+    26, 160, 253, 181, 73, 182, 209, 188, 3, 248, 41, 70,
 ];
 
 /// `Sysvar1nstructions1111111111111111111111111` — optional swap remaining
@@ -125,7 +126,12 @@ pub fn derive_dbc_event_authority() -> [u8; 32] {
 pub fn derive_dbc_pool(config: &[u8; 32], base_mint: &[u8; 32]) -> [u8; 32] {
     let (first, second) = ordered_keys(&WSOL_MINT, base_mint);
     find_program_address(
-        &[b"pool", config.as_slice(), first.as_slice(), second.as_slice()],
+        &[
+            b"pool",
+            config.as_slice(),
+            first.as_slice(),
+            second.as_slice(),
+        ],
         &DBC_PROGRAM,
     )
 }
@@ -139,22 +145,14 @@ pub fn derive_dbc_token_vault(pool: &[u8; 32], mint: &[u8; 32]) -> [u8; 32] {
 
 pub fn derive_metadata(mint: &[u8; 32]) -> [u8; 32] {
     find_program_address(
-        &[
-            b"metadata",
-            METADATA_PROGRAM.as_slice(),
-            mint.as_slice(),
-        ],
+        &[b"metadata", METADATA_PROGRAM.as_slice(), mint.as_slice()],
         &METADATA_PROGRAM,
     )
 }
 
 pub fn derive_token_ata(owner: &[u8; 32], mint: &[u8; 32]) -> [u8; 32] {
     find_program_address(
-        &[
-            owner.as_slice(),
-            TOKEN_PROGRAM.as_slice(),
-            mint.as_slice(),
-        ],
+        &[owner.as_slice(), TOKEN_PROGRAM.as_slice(), mint.as_slice()],
         &ATA_PROGRAM,
     )
 }
@@ -172,7 +170,11 @@ pub fn derive_launch(config: &[u8; 32], mint: &[u8; 32], raise: &[u8; 32]) -> De
     }
 }
 
-fn acc<'a>(msg: &'a LegacyMessage, ix_accounts: &[u8], i: usize) -> Result<&'a [u8; 32], ShapeError> {
+fn acc<'a>(
+    msg: &'a LegacyMessage,
+    ix_accounts: &[u8],
+    i: usize,
+) -> Result<&'a [u8; 32], ShapeError> {
     let idx = *ix_accounts.get(i).ok_or(ShapeError::MissingAccounts)? as usize;
     msg.account_keys.get(idx).ok_or(ShapeError::MissingAccounts)
 }
@@ -206,7 +208,8 @@ fn read_borsh_string(data: &[u8], offset: &mut usize) -> Result<String, ShapeErr
     if *offset + len > data.len() {
         return Err(ShapeError::WrongParams);
     }
-    let s = std::str::from_utf8(&data[*offset..*offset + len]).map_err(|_| ShapeError::WrongParams)?;
+    let s =
+        std::str::from_utf8(&data[*offset..*offset + len]).map_err(|_| ShapeError::WrongParams)?;
     *offset += len;
     Ok(s.to_string())
 }
@@ -233,8 +236,8 @@ fn parse_init(data: &[u8]) -> Result<(String, String, String), ShapeError> {
 /// `swap` = disc + `{amount_in: u64, minimum_amount_out: u64}` (exactly 24).
 /// `swap2` = disc + `{amount_0, amount_1, swap_mode: u8}` (exactly 25).
 /// Builder uses ExactIn (`swap_mode = 0`) with `amount_in = credited − fee`
-/// and `minimum_amount_out ≥ 1` (nonzero floor; no on-chain quote, so this is
-/// the slippage bound). Extra trailing bytes are rejected.
+/// and `minimum_amount_out` exactly equal to `LaunchCheck.min_out` (the
+/// contract's first-buy quote). Extra trailing bytes are rejected.
 fn parse_swap_amounts(data: &[u8]) -> Result<(u64, u64), ShapeError> {
     if data.len() < 8 {
         return Err(ShapeError::WrongBuyAmount);
@@ -274,12 +277,18 @@ fn require_relayer_payer(
 }
 
 fn fee_payer(msg: &LegacyMessage) -> Result<[u8; 32], ShapeError> {
-    msg.account_keys.first().copied().ok_or(ShapeError::MissingAccounts)
+    msg.account_keys
+        .first()
+        .copied()
+        .ok_or(ShapeError::MissingAccounts)
 }
 
 /// Validate a legacy Shape C message. Versioned / ALT messages never reach
 /// here — `parse_legacy_message` rejects the 0x80 prefix first.
-pub fn validate_launch(msg: &LegacyMessage, check: &LaunchCheck) -> Result<ValidatedLaunch, ShapeError> {
+pub fn validate_launch(
+    msg: &LegacyMessage,
+    check: &LaunchCheck,
+) -> Result<ValidatedLaunch, ShapeError> {
     if msg.instructions.is_empty() {
         return Err(ShapeError::NoInstructions);
     }
@@ -379,7 +388,11 @@ pub fn validate_launch(msg: &LegacyMessage, check: &LaunchCheck) -> Result<Valid
         }
 
         if program == &TOKEN_PROGRAM {
-            let disc = ix.data.first().copied().ok_or(ShapeError::ExtraInstruction)?;
+            let disc = ix
+                .data
+                .first()
+                .copied()
+                .ok_or(ShapeError::ExtraInstruction)?;
             if disc == TOKEN_SYNC_NATIVE {
                 if ix.accounts.len() != 1 {
                     return Err(ShapeError::MissingAccounts);
@@ -487,8 +500,8 @@ pub fn validate_launch(msg: &LegacyMessage, check: &LaunchCheck) -> Result<Valid
             if amount_in != check.buy_lamports {
                 return Err(ShapeError::WrongBuyAmount);
             }
-            if min_out < check.min_out {
-                return Err(ShapeError::WrongBuyAmount);
+            if min_out != check.min_out {
+                return Err(ShapeError::WrongMinOut);
             }
             buy_lamports = amount_in;
         } else {
@@ -570,6 +583,7 @@ pub(crate) mod tests {
         config: [u8; 32],
         buy: u64,
         fee_lamports: u64,
+        min_out: u64,
         name: &str,
         symbol: &str,
         uri: &str,
@@ -638,7 +652,7 @@ pub(crate) mod tests {
             CompiledInstruction {
                 program_id_index: 15,
                 accounts: swap_accounts,
-                data: swap_data(buy, 1),
+                data: swap_data(buy, min_out),
             },
             CompiledInstruction {
                 program_id_index: 12,
@@ -688,6 +702,7 @@ pub(crate) mod tests {
             config,
             985,
             15,
+            1,
             "Demo",
             "DEMO",
             "https://example.com/m.json",
@@ -705,7 +720,11 @@ pub(crate) mod tests {
         assert_eq!(got.buy_lamports, 985);
         assert_eq!(got.fill_fee_in_tx, 15);
         let bytes = serialize_legacy_message(&msg);
-        assert!(bytes.len() < 1232, "launch message is {} bytes", bytes.len());
+        assert!(
+            bytes.len() < 1232,
+            "launch message is {} bytes",
+            bytes.len()
+        );
         assert!(bytes[0] & 0x80 == 0);
     }
 
@@ -738,7 +757,16 @@ pub(crate) mod tests {
     #[test]
     fn rejects_wrong_name() {
         let msg = launch_message(
-            key(8), key(1), key(2), key(3), key(4), 985, 15, "Nope", "DEMO",
+            key(8),
+            key(1),
+            key(2),
+            key(3),
+            key(4),
+            985,
+            15,
+            1,
+            "Nope",
+            "DEMO",
             "https://example.com/m.json",
         );
         let err = validate_launch(&msg, &check(key(1), key(2), key(3), key(4))).unwrap_err();
@@ -784,7 +812,16 @@ pub(crate) mod tests {
     #[test]
     fn accepts_when_fill_fee_already_paid() {
         let msg = launch_message(
-            key(8), key(1), key(2), key(3), key(4), 985, 0, "Demo", "DEMO",
+            key(8),
+            key(1),
+            key(2),
+            key(3),
+            key(4),
+            985,
+            0,
+            1,
+            "Demo",
+            "DEMO",
             "https://example.com/m.json",
         );
         let mut c = check(key(1), key(2), key(3), key(4));
@@ -919,7 +956,8 @@ pub(crate) mod tests {
     #[test]
     fn rejects_wrap_without_sync_native() {
         let (raise, mint, fee, config, mut msg) = standard();
-        msg.instructions.retain(|ix| ix.data.first() != Some(&TOKEN_SYNC_NATIVE));
+        msg.instructions
+            .retain(|ix| ix.data.first() != Some(&TOKEN_SYNC_NATIVE));
         let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
         assert_eq!(err, ShapeError::WrongWrap);
     }
@@ -1024,7 +1062,16 @@ pub(crate) mod tests {
             .unwrap();
         swap.data = swap_data(985, 0);
         let err = validate_launch(&msg, &check(raise, mint, fee, config)).unwrap_err();
-        assert_eq!(err, ShapeError::WrongBuyAmount);
+        assert_eq!(err, ShapeError::WrongMinOut);
+    }
+
+    #[test]
+    fn rejects_min_out_other_than_the_check() {
+        let (raise, mint, fee, config, msg) = standard();
+        let mut c = check(raise, mint, fee, config);
+        c.min_out = 2;
+        let err = validate_launch(&msg, &c).unwrap_err();
+        assert_eq!(err, ShapeError::WrongMinOut);
     }
 
     #[test]
@@ -1106,6 +1153,7 @@ pub(crate) mod tests {
         _pool: [u8; 32],
         buy: u64,
         fee_lamports: u64,
+        min_out: u64,
         name: &str,
         symbol: &str,
         uri: &str,
@@ -1118,13 +1166,18 @@ pub(crate) mod tests {
             config,
             buy,
             fee_lamports,
+            min_out,
             name,
             symbol,
             uri,
         ))
     }
 
-    pub(crate) fn fixture_derived_pool(config: [u8; 32], mint: [u8; 32], raise: [u8; 32]) -> [u8; 32] {
+    pub(crate) fn fixture_derived_pool(
+        config: [u8; 32],
+        mint: [u8; 32],
+        raise: [u8; 32],
+    ) -> [u8; 32] {
         derive_launch(&config, &mint, &raise).pool
     }
 

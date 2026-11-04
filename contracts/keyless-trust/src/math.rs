@@ -98,7 +98,7 @@ pub fn apply_rent_dust_closeout(eligible: u64, remaining_on_account: u64) -> u64
 }
 
 /// Raw base units of a 1_000_000_000 supply at 6 decimals (the pinned DBC
-/// curve). The watcher-reported `tokens_bought` cannot exceed this.
+/// curve). The quoted first-buy output cannot exceed this.
 pub const MAX_TOKENS_BOUGHT: u64 = 1_000_000_000 * 1_000_000;
 
 /// `floor(tokens_bought * credited / credited_total)`.

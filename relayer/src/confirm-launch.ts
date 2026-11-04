@@ -1,13 +1,13 @@
 /**
- * Watcher-only: `confirm_launch_outcome(message_hash, solana_sig, tokens_bought)`
- * after the launch lands. Records the raise-ATA token balance (6-decimal raw
- * units, JSON string so values above 2^53 survive), pool, and fill fee, then
- * moves the trust to Launched (or Distributed when every floor share is 0).
+ * Watcher-only: `confirm_launch_outcome(message_hash, solana_sig)` after the
+ * launch lands. The share basis was stored at `request_launch` from the
+ * contract quote. This call does not take a token balance. Surplus above
+ * `minimum_amount_out` stays in the raise ATA.
  *
  * Refuses unless EXECUTE_CONFIRM_LAUNCH=1.
  *
  * Env: CONTRACT_ID, NEAR_ACCOUNT_ID, NEAR_PRIVATE_KEY,
- *      LAUNCH_MESSAGE_HASH, SOLANA_SIG, TOKENS_BOUGHT.
+ *      LAUNCH_MESSAGE_HASH, SOLANA_SIG.
  */
 import { Account, JsonRpcProvider, KeyPairString, teraToGas } from "near-api-js";
 import { TESTNET_RPC } from "./near-rpc.ts";
@@ -18,21 +18,10 @@ export async function runConfirmLaunch(): Promise<void> {
   const privateKey = process.env.NEAR_PRIVATE_KEY as KeyPairString | undefined;
   const messageHash = process.env.LAUNCH_MESSAGE_HASH;
   const solanaSig = process.env.SOLANA_SIG;
-  const tokensBought = process.env.TOKENS_BOUGHT;
-  if (
-    !contractId ||
-    !accountId ||
-    !privateKey ||
-    !messageHash ||
-    !solanaSig ||
-    !tokensBought
-  ) {
+  if (!contractId || !accountId || !privateKey || !messageHash || !solanaSig) {
     throw new Error(
-      "Set CONTRACT_ID, NEAR_ACCOUNT_ID, NEAR_PRIVATE_KEY, LAUNCH_MESSAGE_HASH, SOLANA_SIG, TOKENS_BOUGHT.",
+      "Set CONTRACT_ID, NEAR_ACCOUNT_ID, NEAR_PRIVATE_KEY, LAUNCH_MESSAGE_HASH, SOLANA_SIG.",
     );
-  }
-  if (!/^[1-9][0-9]*$/.test(tokensBought)) {
-    throw new Error("TOKENS_BOUGHT must be a positive decimal integer (6-decimal raw units).");
   }
 
   if (process.env.EXECUTE_CONFIRM_LAUNCH !== "1") {
@@ -44,7 +33,6 @@ export async function runConfirmLaunch(): Promise<void> {
           contractId,
           messageHash,
           solanaSig,
-          tokensBought,
         },
         null,
         2,
@@ -63,14 +51,11 @@ export async function runConfirmLaunch(): Promise<void> {
     args: {
       message_hash: messageHash,
       solana_sig: solanaSig,
-      tokens_bought: tokensBought,
     },
     gas: teraToGas(30),
     deposit: 1n,
   });
-  console.log(
-    JSON.stringify({ contractId, messageHash, solanaSig, tokensBought, result }, null, 2),
-  );
+  console.log(JSON.stringify({ contractId, messageHash, solanaSig, result }, null, 2));
 }
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;

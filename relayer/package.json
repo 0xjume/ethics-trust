@@ -5,7 +5,8 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "test": "node --import tsx --test src/derive-addresses.test.ts src/legacy-message.test.ts src/verify-dbc-sdk.test.ts src/near-signed-solana-transfer.test.ts src/deposit-address.test.ts src/deploy-testnet.test.ts src/watcher.test.ts src/launch-math.test.ts src/launch-message.test.ts src/distribute-math.test.ts src/distribute-message.test.ts",
+    "test": "node --import tsx --test src/derive-addresses.test.ts src/legacy-message.test.ts src/verify-dbc-sdk.test.ts src/near-signed-solana-transfer.test.ts src/deposit-address.test.ts src/deploy-testnet.test.ts src/watcher.test.ts src/launch-math.test.ts src/launch-message.test.ts src/distribute-math.test.ts src/distribute-message.test.ts src/quote-fixtures.test.ts",
+    "generate-quote-fixtures": "tsx src/generate-quote-fixtures.ts",
     "derive-addresses": "tsx src/derive-addresses.ts",
     "deposit-address": "tsx src/deposit-address.ts",
     "dbc-tx-size": "tsx src/dbc-tx-size.ts",

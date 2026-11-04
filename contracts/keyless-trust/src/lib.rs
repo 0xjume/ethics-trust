@@ -3,7 +3,7 @@
 //! Milestone 4: chip-in / refund / sweep, DBC Shape C launch, pro-rata
 //! Shape D distribution.
 
-use near_sdk::json_types::{Base64VecU8, U64};
+use near_sdk::json_types::Base64VecU8;
 use near_sdk::serde_json::Value;
 use near_sdk::store::{IterableMap, LookupMap};
 use near_sdk::{
@@ -14,6 +14,7 @@ mod bs58;
 mod math;
 mod mpc;
 mod pda;
+mod quote;
 pub mod shapes;
 pub mod solana;
 
@@ -26,6 +27,7 @@ use mpc::{
     contributor_path, derive_path, derived_public_key_promise, sign_eddsa_promise, DOMAIN_ED25519,
     MPC_CALLBACK_GAS, ONE_YOCTO,
 };
+use quote::{append_curve_bytes, quote_first_buy, validate_curve, DbcCurve};
 use shapes::dbc::TOKEN_PROGRAM;
 use shapes::{
     decode_dbc_program, parse_distribute, resolve_owners, validate_launch,
@@ -84,6 +86,9 @@ pub struct CreateTrustConfig {
     pub fill_fee_bps: Option<u16>,
     pub execution_timeout_ns: Option<u64>,
     pub watcher: AccountId,
+    /// Pinned DBC curve. The first-buy quote is computed from this, not from
+    /// a watcher balance. Committed in `params_hash`.
+    pub curve: DbcCurve,
 }
 
 #[near(serializers = [json, borsh])]
@@ -109,11 +114,14 @@ pub struct Trust {
     pub name: String,
     pub symbol: String,
     pub uri: String,
+    /// Curve quoted at `request_launch`. Committed in `params_hash`.
+    pub curve: DbcCurve,
     pub params_hash: String,
     pub credited_total: u64,
     pub overflow_total: u64,
-    /// Watcher-reported raw token balance of the raise ATA at launch
-    /// confirm. 0 until then. Capped at `MAX_TOKENS_BOUGHT`.
+    /// First-buy output quoted at `request_launch` and pinned as
+    /// `minimum_amount_out`. 0 until launch is requested. Confirm does not
+    /// change it. Surplus the swap delivers above this stays in the raise ATA.
     pub tokens_bought: u64,
     /// Sum of floor shares. Dust is `tokens_bought - claimable_total`.
     pub claimable_total: u64,
@@ -145,6 +153,7 @@ pub struct TrustView {
     pub name: String,
     pub symbol: String,
     pub uri: String,
+    pub curve: DbcCurve,
     pub params_hash: String,
     pub credited_total: u64,
     pub overflow_total: u64,
@@ -193,6 +202,7 @@ impl From<&Trust> for TrustView {
             name: trust.name.clone(),
             symbol: trust.symbol.clone(),
             uri: trust.uri.clone(),
+            curve: trust.curve.clone(),
             params_hash: trust.params_hash.clone(),
             credited_total: trust.credited_total,
             overflow_total: trust.overflow_total,
@@ -313,8 +323,14 @@ fn projected_state(trust: &Trust) -> TrustState {
     }
 }
 
-fn pin_params_hash(dbc_config: &str, name: &str, symbol: &str, uri: &str) -> String {
-    let mut buf = Vec::with_capacity(dbc_config.len() + name.len() + symbol.len() + uri.len() + 3);
+fn pin_params_hash(
+    dbc_config: &str,
+    name: &str,
+    symbol: &str,
+    uri: &str,
+    curve: &DbcCurve,
+) -> String {
+    let mut buf = Vec::with_capacity(dbc_config.len() + name.len() + symbol.len() + uri.len() + 64);
     buf.extend_from_slice(dbc_config.as_bytes());
     buf.push(0);
     buf.extend_from_slice(name.as_bytes());
@@ -322,6 +338,7 @@ fn pin_params_hash(dbc_config: &str, name: &str, symbol: &str, uri: &str) -> Str
     buf.extend_from_slice(symbol.as_bytes());
     buf.push(0);
     buf.extend_from_slice(uri.as_bytes());
+    append_curve_bytes(&mut buf, curve);
     hex::encode(env::sha256(&buf))
 }
 
@@ -440,12 +457,14 @@ impl Contract {
         require!(cap > 0 && cap <= 10_000, "cap_bps out of range");
         require!(fill_fee <= 10_000, "fill_fee_bps out of range");
         require!(timeout > 0, "execution_timeout_ns must be > 0");
+        validate_curve(&config.curve).unwrap_or_else(|e| env::panic_str(e));
 
         let params_hash = pin_params_hash(
             &config.dbc_config,
             &config.name,
             &config.symbol,
             &config.uri,
+            &config.curve,
         );
         let trust = Trust {
             id,
@@ -468,6 +487,7 @@ impl Contract {
             name: config.name,
             symbol: config.symbol,
             uri: config.uri,
+            curve: config.curve,
             params_hash,
             credited_total: 0,
             overflow_total: 0,
@@ -959,7 +979,13 @@ impl Contract {
     /// Shape C: DBC initialize_virtual_pool_with_spl_token + first-buy swap.
     /// Executing only, after every sweep has been confirmed. Two MPC signs
     /// (raise + mint at `trust/<id>/mint`). Attach ≥ `launch_attach_tgas()`
-    /// (90 TGas). Watcher-only — anyone else locking launch for 150 s is griefing.
+    /// (90 TGas). The quote is local arithmetic on the pinned curve (no extra
+    /// promise), so that gas budget is unchanged. Watcher-only — anyone else
+    /// locking launch for 150 s is griefing.
+    ///
+    /// `minimum_amount_out` must equal the contract's exact-in quote of
+    /// `credited − fill fee`. That quote is stored as `tokens_bought` here.
+    /// Confirm does not take a balance.
     #[payable]
     pub fn request_launch(&mut self, trust_id: u64, message: Base64VecU8) -> Promise {
         require!(
@@ -982,6 +1008,7 @@ impl Contract {
             fill_fee_paid,
             raise_path,
             mint_path,
+            curve,
         ) = {
             let trust = self.trusts.get(&trust_id).expect("unknown trust");
             (
@@ -998,6 +1025,7 @@ impl Contract {
                 trust.fill_fee_paid,
                 trust.raise_path.clone(),
                 trust.mint_path.clone(),
+                trust.curve.clone(),
             )
         };
         require!(state == TrustState::Executing, "launch only in Executing");
@@ -1030,6 +1058,7 @@ impl Contract {
         let fee_lamports = fill_fee_lamports(credited, fill_fee_bps);
         let buy = credited.saturating_sub(fee_lamports);
         require!(buy > 0, "nothing to buy");
+        let quoted = quote_first_buy(&curve, buy).unwrap_or_else(|e| env::panic_str(e));
         let already_paid = fill_fee_paid >= fee_lamports;
         let msg = parse_legacy_message(&message.0).expect("invalid Solana message");
         let checked = validate_launch(
@@ -1046,10 +1075,20 @@ impl Contract {
                 buy_lamports: buy,
                 fill_fee_lamports: fee_lamports,
                 fill_fee_already_paid: already_paid,
-                min_out: 1,
+                min_out: quoted,
             },
         )
         .unwrap_or_else(|e| env::panic_str(e.as_str()));
+        {
+            let trust = self.trusts.get_mut(&trust_id).expect("unknown trust");
+            if trust.tokens_bought != 0 {
+                require!(
+                    trust.tokens_bought == quoted,
+                    "tokens bought does not match the quote"
+                );
+            }
+            trust.tokens_bought = quoted;
+        }
         let extra = format!(
             "{}:{}",
             crate::bs58::encode(&checked.pool),
@@ -1168,40 +1207,23 @@ impl Contract {
     }
 
     /// Watcher reports that the signed Solana tx landed. Settles the pending
-    /// entry keyed by `sha256(message)` hex. Launch pendings must use
-    /// `confirm_launch_outcome` so `tokens_bought` is recorded in the same
-    /// transaction. Omitting that field here stays valid for sweep, refund,
-    /// fill-fee, and distribute.
+    /// entry keyed by `sha256(message)` hex. Sweep, refund, fill-fee, and
+    /// distribute. Launch pendings use `confirm_launch_outcome`.
     #[payable]
     pub fn confirm_transfer(&mut self, message_hash: String, solana_sig: String) {
-        self.confirm_inner(message_hash, solana_sig, None);
+        self.confirm_inner(message_hash, solana_sig, false);
     }
 
-    /// Launch confirm. Records the raise ATA balance the watcher read after
-    /// the first buy (`1..=MAX_TOKENS_BOUGHT`, 6-decimal raw units, capped
-    /// at the pinned 1B supply). A lying watcher can scale every share down
-    /// (residual stays in the raise ATA) or up to that cap (transfers then
-    /// fail on Solana if the ATA is short). It cannot change who is paid.
+    /// Launch confirm. The share basis is the quote stored at
+    /// `request_launch`. This method does not take `tokens_bought`. Any
+    /// tokens the swap delivered above `minimum_amount_out` stay in the
+    /// raise ATA and are not claimable.
     #[payable]
-    pub fn confirm_launch_outcome(
-        &mut self,
-        message_hash: String,
-        solana_sig: String,
-        tokens_bought: U64,
-    ) {
-        // `U64` accepts a JSON string, so a 6-decimal supply above 2^53
-        // round-trips. `confirm_transfer` stays two arguments: near-sdk
-        // 5.17 does not default a missing `Option`, and a third field
-        // would break sweep / refund confirms.
-        self.confirm_inner(message_hash, solana_sig, Some(tokens_bought.0));
+    pub fn confirm_launch_outcome(&mut self, message_hash: String, solana_sig: String) {
+        self.confirm_inner(message_hash, solana_sig, true);
     }
 
-    fn confirm_inner(
-        &mut self,
-        message_hash: String,
-        solana_sig: String,
-        tokens_bought: Option<u64>,
-    ) {
+    fn confirm_inner(&mut self, message_hash: String, solana_sig: String, launch: bool) {
         require!(env::attached_deposit() >= ONE_YOCTO, "attach 1 yoctoNEAR");
         require!(
             solana_sig.len() >= 64 && solana_sig.len() <= 128,
@@ -1219,19 +1241,10 @@ impl Contract {
         require!(!pending.settled, "pending already settled");
         require!(!pending.superseded, "pending superseded");
         self.apply_timeouts(pending.trust_id);
-        if pending.kind == "launch" {
-            let tokens = tokens_bought
-                .unwrap_or_else(|| env::panic_str("tokens_bought required to confirm launch"));
-            require!(
-                tokens > 0 && tokens <= MAX_TOKENS_BOUGHT,
-                "tokens_bought out of range"
-            );
-        } else {
-            require!(
-                tokens_bought.is_none(),
-                "tokens_bought only on launch confirm"
-            );
-        }
+        require!(
+            (pending.kind == "launch") == launch,
+            "use confirm_launch_outcome for launch and confirm_transfer otherwise"
+        );
         if pending.kind == "distribute" {
             for leg in parse_distribute_extra(&pending.extra) {
                 let lk = lock_key(pending.trust_id, &leg.contributor, "distribute");
@@ -1269,7 +1282,7 @@ impl Contract {
             env::predecessor_account_id() == watcher,
             "only the trusted watcher can confirm transfers"
         );
-        self.settle_pending(&pending, &solana_sig, tokens_bought);
+        self.settle_pending(&pending, &solana_sig);
     }
 
     /// Anyone may release an expired, unsettled pending so the balance can
@@ -1583,16 +1596,13 @@ impl Contract {
     }
 
     fn sum_shares(&self, trust_id: u64, tokens: u64, credited_total: u64) -> u64 {
-        self.ledger
-            .values()
-            .filter(|row| row.trust_id == trust_id)
-            .fold(0u64, |acc, row| {
-                acc.saturating_add(pro_rata_share(
-                    tokens,
-                    row.credited_lamports,
-                    credited_total,
-                ))
-            })
+        let mut acc = 0u64;
+        for row in self.ledger.values().filter(|row| row.trust_id == trust_id) {
+            let share = pro_rata_share(tokens, row.credited_lamports, credited_total);
+            acc = acc.checked_add(share).expect("share sum overflow");
+        }
+        require!(acc <= tokens, "share sum exceeds tokens bought");
+        acc
     }
 
     fn lock_pending(
@@ -1756,12 +1766,7 @@ impl Contract {
         }
     }
 
-    fn settle_pending(
-        &mut self,
-        pending: &PendingTransfer,
-        solana_sig: &str,
-        tokens_bought: Option<u64>,
-    ) {
+    fn settle_pending(&mut self, pending: &PendingTransfer, solana_sig: &str) {
         match pending.kind.as_str() {
             "sweep" | "refund" | "raise_refund" => {
                 let key = ledger_key(pending.trust_id, &pending.contributor);
@@ -1815,20 +1820,23 @@ impl Contract {
                 }
             }
             "launch" => {
-                let tokens = tokens_bought
-                    .unwrap_or_else(|| env::panic_str("tokens_bought required to confirm launch"));
+                let (curve, stored, credited_total) = {
+                    let trust = self.trusts.get(&pending.trust_id).expect("unknown trust");
+                    (
+                        trust.curve.clone(),
+                        trust.tokens_bought,
+                        trust.credited_total,
+                    )
+                };
+                let quoted =
+                    quote_first_buy(&curve, pending.lamports).unwrap_or_else(|e| env::panic_str(e));
                 require!(
-                    tokens > 0 && tokens <= MAX_TOKENS_BOUGHT,
-                    "tokens_bought out of range"
+                    quoted == stored && stored > 0 && stored <= MAX_TOKENS_BOUGHT,
+                    "quoted output does not match stored basis"
                 );
-                let credited_total = self
-                    .trusts
-                    .get(&pending.trust_id)
-                    .expect("unknown trust")
-                    .credited_total;
-                let claimable_total = self.sum_shares(pending.trust_id, tokens, credited_total);
+                let claimable_total = self.sum_shares(pending.trust_id, stored, credited_total);
                 if let Some(trust) = self.trusts.get_mut(&pending.trust_id) {
-                    trust.tokens_bought = tokens;
+                    trust.tokens_bought = stored;
                     trust.claimable_total = claimable_total;
                     trust.distributed_total = 0;
                     trust.state = if claimable_total == 0 {
@@ -2143,6 +2151,7 @@ mod tests {
             fill_fee_bps: Some(150),
             execution_timeout_ns: Some(PENDING_EXPIRY_NS.saturating_mul(2)),
             watcher: accounts(2),
+            curve: crate::quote::demo_curve(),
         }
     }
 
@@ -2264,6 +2273,10 @@ mod tests {
         );
     }
 
+    fn quoted_out(buy: u64) -> u64 {
+        quote_first_buy(&crate::quote::demo_curve(), buy).expect("quote")
+    }
+
     fn launch_bytes(buy: u64, fee: u64) -> Vec<u8> {
         crate::shapes::dbc::tests::fixture_launch_bytes(
             [8u8; 32],
@@ -2274,6 +2287,7 @@ mod tests {
             pool_bytes(),
             buy,
             fee,
+            quoted_out(buy),
             "Demo",
             "DEMO",
             "https://example.com/m.json",
@@ -2342,6 +2356,13 @@ mod tests {
         assert_eq!(c.fill_fee(id), 0);
         assert_eq!(c.launch_attach_tgas(), 90);
         assert_eq!(c.mpc_contract().as_str(), DEFAULT_MPC);
+        let fixture: near_sdk::serde_json::Value =
+            near_sdk::serde_json::from_str(include_str!("../tests/fixtures/dbc_quotes.json"))
+                .unwrap();
+        assert_eq!(
+            trust.params_hash,
+            fixture["demoParamsHash"].as_str().unwrap()
+        );
     }
 
     #[test]
@@ -3169,12 +3190,15 @@ mod tests {
         let pending = c.get_pending(hash.clone()).unwrap();
         assert_eq!(pending.kind, "launch");
         assert_eq!(pending.lamports, 985);
+        let quoted = quoted_out(985);
+        assert_eq!(c.get_trust(id).unwrap().tokens_bought, quoted);
+        assert_eq!(c.get_trust(id).unwrap().claimable_total, 0);
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
-        c.confirm_launch_outcome(hash, SIG_E.into(), U64(1_000_000));
+        c.confirm_launch_outcome(hash, SIG_E.into());
         let trust = c.get_trust(id).unwrap();
         assert_eq!(trust.state, TrustState::Launched);
-        assert_eq!(trust.tokens_bought, 1_000_000);
-        assert_eq!(trust.claimable_total, 1_000_000);
+        assert_eq!(trust.tokens_bought, quoted);
+        assert_eq!(trust.claimable_total, quoted);
         assert_eq!(trust.distributed_total, 0);
         assert_eq!(
             trust.pool_address.as_deref(),
@@ -3189,6 +3213,56 @@ mod tests {
         );
         assert_eq!(trust.fill_fee_paid, 15);
         assert_eq!(trust.mint_address.as_deref(), Some(mint_addr().as_str()));
+    }
+
+    #[test]
+    #[should_panic(expected = "minimum_amount_out is not the quoted first-buy output")]
+    fn request_launch_rejects_min_out_one() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 1_000, 9_000);
+        go_executing_swept(&mut c, id, 1_000, SIG_A, SIG_B);
+        let bytes = crate::shapes::dbc::tests::fixture_launch_bytes(
+            [8u8; 32],
+            raise_bytes(),
+            mint_bytes(),
+            fee_bytes(),
+            config_bytes(),
+            pool_bytes(),
+            985,
+            15,
+            1,
+            "Demo",
+            "DEMO",
+            "https://example.com/m.json",
+        );
+        testing_env!(context(accounts(2), PAID).build());
+        let _ = c.request_launch(id, Base64VecU8(bytes));
+    }
+
+    #[test]
+    #[should_panic(expected = "minimum_amount_out is not the quoted first-buy output")]
+    fn request_launch_rejects_min_out_off_by_one() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 1_000, 9_000);
+        go_executing_swept(&mut c, id, 1_000, SIG_A, SIG_B);
+        let bytes = crate::shapes::dbc::tests::fixture_launch_bytes(
+            [8u8; 32],
+            raise_bytes(),
+            mint_bytes(),
+            fee_bytes(),
+            config_bytes(),
+            pool_bytes(),
+            985,
+            15,
+            quoted_out(985) + 1,
+            "Demo",
+            "DEMO",
+            "https://example.com/m.json",
+        );
+        testing_env!(context(accounts(2), PAID).build());
+        let _ = c.request_launch(id, Base64VecU8(bytes));
     }
 
     #[test]
@@ -3242,6 +3316,7 @@ mod tests {
             pool_bytes(),
             985,
             15,
+            quoted_out(985),
             "Demo",
             "DEMO",
             "https://example.com/m.json",
@@ -3269,7 +3344,7 @@ mod tests {
         testing_env!(context(accounts(2), PAID).build());
         let _ = c.request_launch(id, Base64VecU8(paid.clone()));
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
-        c.confirm_launch_outcome(message_hash(&paid), SIG_F.into(), U64(1_000_000));
+        c.confirm_launch_outcome(message_hash(&paid), SIG_F.into());
         let trust = c.get_trust(id).unwrap();
         assert_eq!(trust.state, TrustState::Launched);
         assert_eq!(trust.fill_fee_paid, 15);
@@ -3296,14 +3371,13 @@ mod tests {
         );
     }
 
-    /// Two credited contributors, sweeps settled, launch confirmed.
-    /// Credits are `amounts` (must sum to `target`). `tokens` is the
-    /// watcher-reported raise-ATA balance.
+    /// Credited contributors, sweeps settled, launch confirmed.
+    /// Credits are `amounts` (must sum to `target`). The share basis is the
+    /// contract quote of `target − fill fee`, not a watcher balance.
     fn go_launched_split(
         c: &mut Contract,
         target: u64,
         amounts: &[(u8, u64)],
-        tokens: u64,
         with_fee: bool,
     ) -> u64 {
         let id = c.create_trust(fill_config(target, 9_000));
@@ -3341,6 +3415,7 @@ mod tests {
             pool_bytes(),
             buy,
             fee,
+            quoted_out(buy),
             "Demo",
             "DEMO",
             "https://example.com/m.json",
@@ -3348,7 +3423,7 @@ mod tests {
         testing_env!(context(accounts(2), PAID).build());
         let _ = c.request_launch(id, Base64VecU8(bytes.clone()));
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
-        c.confirm_launch_outcome(message_hash(&bytes), format!("{:0>88}", 90u8), U64(tokens));
+        c.confirm_launch_outcome(message_hash(&bytes), format!("{:0>88}", 90u8));
         id
     }
 
@@ -3368,11 +3443,13 @@ mod tests {
     fn honest_single_claim_books_on_confirm_and_completes() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 1_000_000, true);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], true);
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Launched);
         let owner = pk_b58(11);
-        assert_eq!(c.claimable(id, owner.clone()), 1_000_000);
-        let bytes = dist_bytes(&[(pk(11), 1_000_000)], true);
+        let share = c.claimable(id, owner.clone());
+        assert_eq!(share, c.get_trust(id).unwrap().tokens_bought);
+        assert!(share > 0);
+        let bytes = dist_bytes(&[(pk(11), share)], true);
         assert!(bytes.len() <= 1232);
         testing_env!(context(accounts(3), PAID).build());
         let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
@@ -3390,11 +3467,11 @@ mod tests {
             c.get_contribution(id, owner.clone())
                 .unwrap()
                 .distributed_tokens,
-            1_000_000
+            share
         );
         let trust = c.get_trust(id).unwrap();
         assert_eq!(trust.state, TrustState::Distributed);
-        assert_eq!(trust.distributed_total, 1_000_000);
+        assert_eq!(trust.distributed_total, share);
         assert_eq!(c.distribution_status(id).dust_tokens, 0);
         assert_eq!(c.claimable(id, owner), 0);
     }
@@ -3403,16 +3480,20 @@ mod tests {
     fn honest_batch_pays_both_and_records_dust() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        // credits 1 and 2, tokens 100 → floors 33 and 66, dust 1.
-        // fill fee on 3 lamports is 0.
-        let id = go_launched_split(&mut c, 3, &[(11, 1), (12, 2)], 100, false);
-        assert_eq!(c.claimable(id, pk_b58(11)), 33);
-        assert_eq!(c.claimable(id, pk_b58(12)), 66);
+        // credits 1 and 2 of target 3. Fill fee is 0, so the buy is 3 lamports
+        // and the basis is the quote of that buy. Dust is strictly less than
+        // the number of credited contributors.
+        let id = go_launched_split(&mut c, 3, &[(11, 1), (12, 2)], false);
+        let a = c.claimable(id, pk_b58(11));
+        let b = c.claimable(id, pk_b58(12));
         let status = c.distribution_status(id);
-        assert_eq!(status.dust_tokens, 1);
+        assert_eq!(a, pro_rata_share(status.tokens_bought, 1, 3));
+        assert_eq!(b, pro_rata_share(status.tokens_bought, 2, 3));
+        assert!(status.dust_tokens < 2);
         assert_eq!(status.decimals, 6);
-        assert_eq!(status.claimable_total, 99);
-        let bytes = dist_bytes(&[(pk(11), 33), (pk(12), 66)], true);
+        assert_eq!(status.claimable_total, a + b);
+        assert!(status.claimable_total <= status.tokens_bought);
+        let bytes = dist_bytes(&[(pk(11), a), (pk(12), b)], true);
         testing_env!(context(accounts(4), c.sign_deposit()).build());
         let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
         // The other contributor is inside the batch, so a second claim is locked.
@@ -3421,18 +3502,74 @@ mod tests {
         c.confirm_transfer(message_hash(&bytes), format!("{:0>88}", 92u8));
         let trust = c.get_trust(id).unwrap();
         assert_eq!(trust.state, TrustState::Distributed);
-        assert_eq!(trust.distributed_total, 99);
+        assert_eq!(trust.distributed_total, a + b);
         assert_eq!(
             c.get_contribution(id, pk_b58(11))
                 .unwrap()
                 .distributed_tokens,
-            33
+            a
         );
         assert_eq!(
             c.get_contribution(id, pk_b58(12))
                 .unwrap()
                 .distributed_tokens,
-            66
+            b
+        );
+    }
+
+    #[test]
+    fn over_reported_basis_is_impossible_and_the_last_claimer_is_paid() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        // 30/60/10 of a 1e9 raise. A 1.5× basis lets the 30% claimer take
+        // more than the raise holds, and the 60% claimer is left short.
+        // The contract basis is the quote of 985_000_000, so that report
+        // cannot be stored.
+        let id = go_launched_split(
+            &mut c,
+            1_000_000_000,
+            &[(11, 300_000_000), (12, 600_000_000), (14, 100_000_000)],
+            true,
+        );
+        let trust = c.get_trust(id).unwrap();
+        let q = trust.tokens_bought;
+        assert_eq!(q, 241_421_378_472_608);
+        let inflated = q * 3 / 2;
+        let early = pro_rata_share(inflated, 300_000_000, 1_000_000_000);
+        let fair60 = pro_rata_share(q, 600_000_000, 1_000_000_000);
+        assert!(q - early < fair60);
+        let s30 = c.claimable(id, pk_b58(11));
+        let s60 = c.claimable(id, pk_b58(12));
+        let s10 = c.claimable(id, pk_b58(14));
+        assert_eq!(s30, pro_rata_share(q, 300_000_000, 1_000_000_000));
+        assert_eq!(s60, fair60);
+        assert_eq!(s10, pro_rata_share(q, 100_000_000, 1_000_000_000));
+        assert!(s30 + s60 + s10 <= q);
+        assert_eq!(trust.claimable_total, s30 + s60 + s10);
+        assert_eq!(
+            trust.claimable_total,
+            c.distribution_status(id).claimable_total
+        );
+        assert_eq!(
+            q - trust.claimable_total,
+            c.distribution_status(id).dust_tokens
+        );
+        for (i, (tag, share)) in [(11u8, s30), (12, s60), (14, s10)].into_iter().enumerate() {
+            let bytes = dist_bytes(&[(pk(tag), share)], true);
+            testing_env!(context(accounts(3), PAID).build());
+            let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
+            testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
+            c.confirm_transfer(message_hash(&bytes), format!("{:0>88}", 80 + i as u8));
+        }
+        let done = c.get_trust(id).unwrap();
+        assert_eq!(done.state, TrustState::Distributed);
+        assert_eq!(done.distributed_total, s30 + s60 + s10);
+        assert_eq!(done.tokens_bought, q);
+        assert_eq!(
+            c.get_contribution(id, pk_b58(12))
+                .unwrap()
+                .distributed_tokens,
+            s60
         );
     }
 
@@ -3440,13 +3577,21 @@ mod tests {
     fn one_contributor_lock_does_not_block_the_other() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        let id = go_launched_split(&mut c, 1_000, &[(11, 600), (12, 400)], 100, true);
-        assert_eq!(c.claimable(id, pk_b58(11)), 60);
-        assert_eq!(c.claimable(id, pk_b58(12)), 40);
-        let first = dist_bytes(&[(pk(11), 60)], false);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 600), (12, 400)], true);
+        let a = c.claimable(id, pk_b58(11));
+        let b = c.claimable(id, pk_b58(12));
+        assert_eq!(
+            a,
+            pro_rata_share(c.get_trust(id).unwrap().tokens_bought, 600, 1_000)
+        );
+        assert_eq!(
+            b,
+            pro_rata_share(c.get_trust(id).unwrap().tokens_bought, 400, 1_000)
+        );
+        let first = dist_bytes(&[(pk(11), a)], false);
         testing_env!(context(accounts(4), PAID).build());
         let _ = c.request_distribute(id, Base64VecU8(first));
-        let second = dist_bytes(&[(pk(12), 40)], true);
+        let second = dist_bytes(&[(pk(12), b)], true);
         testing_env!(context(accounts(5), PAID).build());
         let _ = c.request_distribute(id, Base64VecU8(second.clone()));
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
@@ -3455,7 +3600,7 @@ mod tests {
             c.get_contribution(id, pk_b58(12))
                 .unwrap()
                 .distributed_tokens,
-            40
+            b
         );
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Launched);
     }
@@ -3464,8 +3609,9 @@ mod tests {
     fn late_confirm_without_resign_still_books() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 50, true);
-        let bytes = dist_bytes(&[(pk(11), 50)], true);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], true);
+        let share = c.claimable(id, pk_b58(11));
+        let bytes = dist_bytes(&[(pk(11), share)], true);
         testing_env!(context(accounts(3), PAID).build());
         let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
         let hash = message_hash(&bytes);
@@ -3481,7 +3627,7 @@ mod tests {
             c.get_contribution(id, pk_b58(11))
                 .unwrap()
                 .distributed_tokens,
-            50
+            share
         );
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Distributed);
     }
@@ -3491,13 +3637,14 @@ mod tests {
     fn release_then_resign_rejects_the_old_confirm() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 50, true);
-        let first = dist_bytes(&[(pk(11), 50)], true);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], true);
+        let share = c.claimable(id, pk_b58(11));
+        let first = dist_bytes(&[(pk(11), share)], true);
         testing_env!(context(accounts(3), PAID).build());
         let _ = c.request_distribute(id, Base64VecU8(first.clone()));
         let first_hash = message_hash(&first);
         expire_and_release(&mut c, &first_hash);
-        let second = dist_bytes(&[(pk(11), 50)], false);
+        let second = dist_bytes(&[(pk(11), share)], false);
         testing_env!(context_at(accounts(3), PAID, 1_000 + PENDING_EXPIRY_NS + 1).build());
         let _ = c.request_distribute(id, Base64VecU8(second.clone()));
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
@@ -3506,7 +3653,7 @@ mod tests {
             c.get_contribution(id, pk_b58(11))
                 .unwrap()
                 .distributed_tokens,
-            50
+            share
         );
         c.confirm_transfer(first_hash, format!("{:0>88}", 96u8));
     }
@@ -3516,13 +3663,14 @@ mod tests {
     fn double_claim_after_confirm_is_rejected() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 80, true);
-        let bytes = dist_bytes(&[(pk(11), 80)], true);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], true);
+        let share = c.claimable(id, pk_b58(11));
+        let bytes = dist_bytes(&[(pk(11), share)], true);
         testing_env!(context(accounts(3), PAID).build());
         let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
         c.confirm_transfer(message_hash(&bytes), format!("{:0>88}", 97u8));
-        let again = dist_bytes(&[(pk(11), 80)], false);
+        let again = dist_bytes(&[(pk(11), share)], false);
         testing_env!(context(accounts(3), PAID).build());
         let _ = c.request_distribute(id, Base64VecU8(again));
     }
@@ -3542,7 +3690,7 @@ mod tests {
     fn zero_credit_claim_is_rejected() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 100, true);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], true);
         assert_eq!(
             c.get_contribution(id, pk_b58(13))
                 .unwrap()
@@ -3557,7 +3705,7 @@ mod tests {
     fn launched_for_rejects() -> (Contract, u64) {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 100, true);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], true);
         (c, id)
     }
 
@@ -3654,6 +3802,16 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "only a linear fee scheduler is quoted")]
+    fn create_trust_rejects_exponential_fee() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let mut cfg = demo_config(1_000, 9_000);
+        cfg.curve.base_fee_mode = 1;
+        let _ = c.create_trust(cfg);
+    }
+
+    #[test]
     #[should_panic(expected = "cap_bps out of range")]
     fn create_trust_rejects_zero_cap() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
@@ -3684,7 +3842,7 @@ mod tests {
         testing_env!(context(accounts(2), PAID).build());
         let _ = c.request_launch(id, Base64VecU8(bytes.clone()));
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
-        c.confirm_launch_outcome(message_hash(&bytes), SIG_E.into(), U64(1_000_000));
+        c.confirm_launch_outcome(message_hash(&bytes), SIG_E.into());
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Launched);
         testing_env!(context(accounts(3), PAID).build());
         let _ = c.register(id, DEMO_PUBKEY.into());

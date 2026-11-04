@@ -6,7 +6,7 @@
  * init / ATA payer = relayer (funds pool + ATA rent; raise does not top up)
  * baseMint = derived trust/<id>/mint (no random keypair)
  * first buy = credited_total − 1.5% fill fee
- * min out = 1
+ * min out = SDK quote of that buy on demoCurveConfig (exact, no slippage)
  *
  * Relayer is the Solana fee payer and the init/ATA rent payer. Does not send.
  *
@@ -21,6 +21,7 @@ import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@sol
 import { DynamicBondingCurveClient } from "@meteora-ag/dynamic-bonding-curve-sdk";
 import BN from "bn.js";
 import { demoCurveConfig } from "./dbc-curve.ts";
+import { quoteFirstBuyOutput, storedCurveFromConfig } from "./dbc-quote.ts";
 import { deriveTrustAddresses } from "./derive-addresses.ts";
 import { firstBuyLamports, fillFeeLamports, pinParamsHash } from "./launch-math.ts";
 import { PACKET_LIMIT } from "./dbc-tx-size.ts";
@@ -120,6 +121,7 @@ export async function buildSdkLaunchTransaction(args: {
 }): Promise<Transaction> {
   const client = new DynamicBondingCurveClient(args.connection, "confirmed");
   const curve = demoCurveConfig();
+  const minOut = quoteFirstBuyOutput(curve, new BN(args.buyLamports.toString()));
   const combo = await client.partner.createConfigAndPoolWithFirstBuy({
     payer: args.relayer,
     config: args.config,
@@ -138,7 +140,7 @@ export async function buildSdkLaunchTransaction(args: {
     firstBuyParam: {
       buyer: args.raise,
       buyAmount: new BN(args.buyLamports.toString()),
-      minimumAmountOut: new BN(1),
+      minimumAmountOut: minOut,
       referralTokenAccount: null,
     },
   });
@@ -184,6 +186,8 @@ export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
 
   const connection = new Connection(RPC, "confirmed");
   const client = new DynamicBondingCurveClient(connection, "confirmed");
+  const curve = demoCurveConfig();
+  const minOut = quoteFirstBuyOutput(curve, new BN(buy.toString()));
   const { blockhash } = await connection.getLatestBlockhash("confirmed");
   let poolTx = await client.creator.createPoolWithFirstBuy({
     createPoolParam: {
@@ -198,7 +202,7 @@ export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
     firstBuyParam: {
       buyer: raise,
       buyAmount: new BN(buy.toString()),
-      minimumAmountOut: new BN(1),
+      minimumAmountOut: minOut,
       referralTokenAccount: null,
     },
   });
@@ -221,11 +225,11 @@ export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
     name,
     symbol,
     uri,
-    paramsHash: await pinParamsHash(config, name, symbol, uri),
+    paramsHash: await pinParamsHash(config, name, symbol, uri, storedCurveFromConfig(curve)),
     creditedLamports: credited.toString(),
     fillFeeLamports: alreadyPaid ? "0" : fee.toString(),
     buyLamports: buy.toString(),
-    minOut: "1",
+    minOut: minOut.toString(10),
     messageBytes: message.length,
     packetLimit: PACKET_LIMIT,
     messageBase64: Buffer.from(message).toString("base64"),

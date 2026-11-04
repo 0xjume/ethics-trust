@@ -235,9 +235,12 @@ EXECUTE_CONFIRM_LAUNCH=1 LAUNCH_MESSAGE_HASH=... SOLANA_SIG=... \
   pnpm confirm-launch
 ```
 
-Pro-rata claims are the m9 recipe below. Do not call `request_distribute` on m7.
+Pro-rata claims are the m10 recipe below. Do not call `request_distribute` on m7 or m9. m9 let the watcher set `tokens_bought`.
 
-### Milestone 4 deploy recipe (m9)
+### Milestone 4 deploy recipe (m9) — do not use for new deploys
+
+`confirm_launch_outcome` on m9 took a watcher `tokens_bought`. A 1.5× report
+let an early claimer drain a later claimer's floor. Use the m10 recipe.
 
 Borsh adds `tokens_bought`, `claimable_total`, and `distributed_total` on
 `Trust`, and `distributed_tokens` on `Contribution`. Deploy a **new**
@@ -289,6 +292,65 @@ SOLANA_SUBMIT=1 DISTRIBUTE_MESSAGE_B64=... \
 #     distributed_total >= claimable_total. Dust stays in the raise ATA.
 EXECUTE_CONFIRM_DISTRIBUTE=1 DISTRIBUTE_MESSAGE_HASH=... SOLANA_SIG=... \
   pnpm confirm-distribute
+```
+
+### Quote basis deploy recipe (m10)
+
+m9 Borsh plus `curve` on `CreateTrustConfig` / `Trust`. `confirm_launch_outcome`
+no longer takes `tokens_bought`. Deploy a **new** subaccount. Do not reuse
+m5, m6, m7, or m9. This agent does not deploy or spend. Human-run on NEAR
+**testnet** and Solana **devnet** only.
+
+The curve passed to `create_trust` must be the same curve as `createConfig2`
+(`demoCurveConfig`). `pnpm build-launch-message` pins `minimum_amount_out` to
+the SDK 2.0.0 quote of `credited − fill fee` on that curve. The contract
+recomputes the same quote and rejects any other `min_out`.
+
+```bash
+scripts/build-wasm.sh
+NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
+NEAR_PRIVATE_KEY=ed25519:... \
+DEPLOY_SUBACCOUNT=m10 \
+EXECUTE_DEPLOY=1 \
+pnpm deploy-testnet
+# → m10.keyless-trust-dev-54ef71.testnet  (waitUntil FINAL, no full-access key)
+
+export CONTRACT_ID=m10.keyless-trust-dev-54ef71.testnet
+export NEAR_PREDECESSOR=$CONTRACT_ID
+export TRUST_ID=1
+
+# 1–2. Same as m9: derive raise / fees / mint, then createConfig2
+#      (feeClaimer = fees, leftoverReceiver = raise). Copy DBC_CONFIG.
+
+# 3. create_trust. curve is the demo object (snake_case). U128 fields are
+#    decimal strings. This curve is committed in params_hash.
+#    sqrt_start_price "32609544831759054"
+#    migration_quote_threshold 10000000000
+#    collect_fee_mode 0          # fee on input
+#    enable_first_swap_with_min_fee true
+#    base_fee_mode 0             # linear only
+#    cliff_fee_numerator 10000000
+#    number_of_period 0
+#    reduction_factor 0
+#    points: [{ sqrt_price: "130438178253327822",
+#               liquidity: "34783514296328165318017769454091" }]
+
+# 4–7. Register, report, sweep, confirm until Executing and swept.
+#      CREDITED_LAMPORTS=<credited_total> DBC_CONFIG=<pubkey> \
+#        pnpm build-launch-message
+#      message.minOut is the quote, not 1.
+#      EXECUTE_REQUEST_LAUNCH=1 LAUNCH_MESSAGE_B64=... pnpm request-launch
+#      (90 TGas + 0.01 NEAR). Then relay-launch as in the m7 recipe.
+#      After request_launch, get_trust.tokens_bought is already that quote.
+
+# 8. Watcher confirms the landed signature only. No TOKENS_BOUGHT.
+EXECUTE_CONFIRM_LAUNCH=1 LAUNCH_MESSAGE_HASH=... SOLANA_SIG=... \
+  pnpm confirm-launch
+# state = Launched. claimable_total is the sum of floors (≤ tokens_bought).
+
+# 9–12. Same claims as m9. Read tokens_bought from get_trust (do not invent it).
+#       DISTRIBUTE when distributed_total >= claimable_total.
+#       Surplus the swap delivered above min_out stays in the raise ATA.
 ```
 
 ### Deploy script
