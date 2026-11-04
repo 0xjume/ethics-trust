@@ -6,7 +6,8 @@
   "license": "MIT",
   "packageManager": "pnpm@10.33.4",
   "scripts": {
-    "test": "pnpm --filter @keyless-trust/relayer test && pnpm --filter @keyless-trust/ui test",
+    "test": "pnpm --filter @keyless-trust/relayer test && pnpm --filter @keyless-trust/ui test && pnpm --filter @keyless-trust/app test",
+    "build:ui": "pnpm --filter @keyless-trust/ui build",
     "derive-addresses": "pnpm --filter @keyless-trust/relayer derive-addresses",
     "deposit-address": "pnpm --filter @keyless-trust/relayer deposit-address",
     "deploy-testnet": "pnpm --filter @keyless-trust/relayer deploy-testnet",

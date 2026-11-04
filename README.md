@@ -31,8 +31,31 @@ pnpm derive-addresses          # read-only NEAR testnet view
 pnpm deposit-address           # path trust/<id>/in/<pubkey> → Solana address
 pnpm verify-dbc-sdk            # read-only Solana devnet
 pnpm dbc-tx-size               # builds txs, does not send
-pnpm dev:app                   # placeholder Trust room (Ethics Launch tokens)
+pnpm dev:app                   # Keyless Trust room at http://localhost:3000
 ```
+
+The app reads NEAR testnet and Solana devnet through public RPC. Optional env
+(see `.env.example`): `NEXT_PUBLIC_CONTRACT_ID` (default
+`m10.keyless-trust-dev-54ef71.testnet`), `NEXT_PUBLIC_NEAR_RPC_URL`,
+`NEXT_PUBLIC_SOLANA_RPC_URL`. There is no mainnet switch and no secret in the
+client. Trust lists, detail, and Verify work without a wallet.
+
+### Deploy on Vercel
+
+Do not deploy from CI. When you import the repo in Vercel:
+
+1. Framework preset: Next.js.
+2. Root directory: `app`.
+3. Include source files outside of the root directory: on (the app depends on `packages/ui`).
+4. Install command: `cd .. && pnpm install --frozen-lockfile`.
+5. Build command: `cd .. && pnpm --filter @keyless-trust/app build`.
+6. Environment: the three `NEXT_PUBLIC_*` variables above. No keys.
+
+`app/vercel.json` records those install and build commands for a project whose
+root directory is `app`. `next.config.mjs` traces files from the repository
+root so the workspace package is included in the serverless bundle. Pages are
+client-rendered against public RPC, including `/trusts/[id]`, so this is a
+Next server deploy rather than `output: "export"`.
 
 The MPC transfer script is `relayer/src/near-signed-solana-transfer.ts`. Do not
 run it here unless you set `EXECUTE_NEAR_SIGNED_TRANSFER=1` (and `SOLANA_SUBMIT=1`

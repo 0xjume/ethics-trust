@@ -6,9 +6,18 @@
   "type": "module",
   "exports": {
     "./tokens.css": "./tokens.css",
-    "./tailwind.theme": "./tailwind.theme.cjs"
+    "./tailwind.theme": "./tailwind.theme.cjs",
+    "./format": {
+      "types": "./format.d.ts",
+      "default": "./format.mjs"
+    },
+    "./validate": {
+      "types": "./validate.d.ts",
+      "default": "./validate.mjs"
+    }
   },
   "scripts": {
-    "test": "node --test tokens.test.mjs"
+    "test": "node --test tokens.test.mjs domain.test.mjs",
+    "build": "node --check format.mjs && node --check validate.mjs && node --check domain.test.mjs && node --check tokens.test.mjs"
   }
 }

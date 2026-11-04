@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+  <text
+    x="2"
+    y="36"
+    fill="#D9DEE3"
+    font-family="Georgia, 'Times New Roman', serif"
+    font-size="36"
+    font-weight="500"
+  >E</text>
+  <g transform="translate(28, 8)">
+    <path
+      d="M10 0 L11.6 8.4 L20 10 L11.6 11.6 L10 20 L8.4 11.6 L0 10 L8.4 8.4 Z"
+      fill="#38BFA7"
+    />
+  </g>
+</svg>

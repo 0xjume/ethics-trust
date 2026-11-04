@@ -35,3 +35,9 @@ jobs:
       - run: pnpm test
       - name: Typecheck relayer
         run: pnpm --filter @keyless-trust/relayer exec tsc --noEmit
+      - name: Build UI package
+        run: pnpm --filter @keyless-trust/ui build
+      - name: Typecheck app
+        run: pnpm --filter @keyless-trust/app typecheck
+      - name: Build app
+        run: pnpm --filter @keyless-trust/app build
