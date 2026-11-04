@@ -130,12 +130,17 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 - Fill fee: exact 1.5% raise → fee vault, either in this tx or a prior `request_fill_fee` shape.
 - Double execution: a second landing fails because the pool PDA already exists.
 - Allowed only in `Executing` after all sweeps are reported landed.
-- `request_distribute` is a Milestone 4 stub.
+- Launch confirm is `confirm_launch_outcome(message_hash, solana_sig, tokens_bought)`. `confirm_transfer` stays two arguments so sweep and refund JSON does not gain a field.
 
 ### 3.5 Shape D — Pro-rata distribution (raise vault → contributors)
-- Signer: raise vault. Repeated pairs: `ATA::CreateIdempotent(payer=raise, ata, owner=<pubkey>, mint=base_mint)` + `Token::Transfer(raise_ata → ata, amount)`, up to ~5 recipients per tx (size budget).
-- Checks: each `owner` is a registered contributor not yet paid; `amount = floor(tokens_bought × swept[pubkey] / Σ swept)`; `Σ paid ≤ tokens_bought`. `tokens_bought` is reported by the watcher after execution (trust point; see §4) and is capped by the curve maths: contract rejects a value above the quote from the committed `amount_in` (optional).
-- Contract marks recipients paid when it signs. Double landing transfers twice only if the raise ATA still holds enough; since the total of all signed transfers ≤ `tokens_bought`, a double landing makes a *later* transfer fail rather than over-pay. Residual is reconciled with a final "remaining dust" transfer to the same recipients.
+- Allowed only in `Launched`, after `tokens_bought` is recorded. Signer: raise vault (`trust/<id>/raise`) only. Relayer is fee payer (account 0) and the only other signer. The relayer is also writable as the destination-ATA rent payer, same as Shape C. Legacy message, no address tables, no ComputeBudget, ≤ 1232 bytes, one raise MPC sign.
+- Token program is classic Tokenkeg. Shape C initializes with `initialize_virtual_pool_with_spl_token` and rejects Token-2022, so distribution uses Tokenkeg only: ATA seeds `[owner, Tokenkeg, mint]`, TransferChecked decimals 6. Mint is the derived `trust/<id>/mint` key. The program id is a constant, not a stored field.
+- Each leg is an optional `CreateIdempotent` (data exactly `[1]`, 6 accounts: relayer, dest ATA, owner, mint, System, Tokenkeg) then one `TransferChecked` (data exactly 10 bytes `[12, amount u64 LE, decimals = 6]`, accounts: raise token ATA, mint, dest ATA, raise authority). No other instructions. Destination owner is the contributor pubkey stored at `register` (the same key refunds pay). A contributor cannot redirect to another owner. Up to 5 legs per call.
+- Share = `floor(tokens_bought × credited / credited_total)`. The basis is **credited** lamports, not swept. Dust (`tokens_bought − Σ floors`) stays in the raise ATA and is not a share. Each remainder is < 1 raw unit, so dust is strictly less than the number of credited contributors. It is not paid to a last recipient.
+- `tokens_bought` is the raise-ATA balance the watcher reports on `confirm_launch_outcome`, bounded to `1..=1_000_000_000 × 10^6` (the pinned 1B supply at 6 decimals). The contract does not store curve parameters, so it cannot recompute the buy. Under-report scales every share down and leaves the residual in the raise ATA. Over-report up to the cap can make a later transfer fail on Solana if the ATA is short. The watcher cannot change who is paid.
+- Nothing is booked at sign. The pending row is keyed by `sha256(message)`, with a per-contributor lock and nonce, 150 s expiry, `release_pending`, `seen_sigs`, and `consumed_hashes`. A re-sign supersedes the released row, so release plus a new sign cannot double-pay. `distributed_tokens` (per contributor) and `distributed_total` update only on `confirm_transfer`. The trust moves to `Distributed` when `distributed_total >= claimable_total` (the sum of floors). If that sum is 0 at launch confirm, the trust goes straight to `Distributed`.
+- Permissionless, with a per-contributor lock. A stranger who pays the 0.01 NEAR `sign_deposit` (excess refunded) can freeze only the contributors named in that message — at most 5 — for 150 s. Leaving someone out does not freeze them. Attach at least 60 TGas (`distribute_attach_tgas`: one 30 TGas `sign`, a 20 TGas callback, and checker headroom).
+- Views: `claimable(trust_id, contributor)`, `distribution_status` (`tokens_bought`, `claimable_total`, `distributed_total`, `dust_tokens`, decimals, token program).
 
 ### 3.6 Shape E (stretch) — Fee split (fee vault → 3 fixed destinations)
 - `claim_creator_trading_fee` (fee vault as creator) then transfers to `holders_distributor` (70%), `ethics_holders_distributor` (20%), `platform` (10%), destinations fixed at `create_trust`. Checks: ratios within 1 lamport rounding; no other destination. The "70% to holders" leg pays a distributor address; true per-holder airdrops are out of scope.
@@ -143,7 +148,7 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
 ## 4. Trust assumptions (to state plainly in the README)
 
 - **MPC network**: Chain Signatures nodes collectively could sign anything; this is the base assumption of the whole NEAR stack.
-- **Watcher/relayer**: NEAR cannot read Solana. A watcher **must** be set at `create_trust`. It reports deposit balances, confirms landed sweeps/refunds (`confirm_transfer`), and the post-buy token amount. A lying or offline watcher can **delay** everything and can **skew the pro-rata split among real registered contributors** (e.g. understate one sweep), but cannot send funds to any address the contract did not derive (owner, raise vault, DBC pool, contributors, fixed fee destinations). Anyone can run a second watcher to audit. Refunds after the deadline are permissionless except that `confirm_transfer` still needs the named watcher.
+- **Watcher/relayer**: NEAR cannot read Solana. A watcher **must** be set at `create_trust`. It reports deposit balances, confirms landed sweeps/refunds/distributes (`confirm_transfer`), and the post-buy token amount (`confirm_launch_outcome`, capped at the 1B×10^6 supply). A lying or offline watcher can **delay** everything and can **skew the pro-rata split among real registered contributors** (under-report scales every floor share down; over-report up to the cap can make transfers fail if the raise ATA is short). It cannot send funds to any address the contract did not derive or to any owner other than the pubkey stored at `register`. Anyone can run a second watcher to audit. Refunds after the deadline are permissionless except that `confirm_transfer` still needs the named watcher. Distribution claims are permissionless too, but a paid claim locks only the included contributors for 150 s.
 - Mitigations: multiple watchers with "first to report, others can dispute within N minutes" (stretch); every report is logged on NEAR so anyone can audit against Solana explorers; optional future: Solana light-client or ZK proofs of account state.
 - **Sybil**: the 1% cap is per *wallet*; one person can split into many wallets. Good enough for a demo, not a fairness guarantee. Say so.
 - **DBC config**: created once by a normal keypair with `createConfig2`; once created it cannot be changed, and the Trust pins its pubkey. `feeClaimer` = fee vault; `leftoverReceiver` = **raise vault**. No human receives partner fees.
@@ -162,9 +167,10 @@ Parse header (`num_required_signatures`, readonly counts), static account keys, 
    │             │ first sweep
    │             ▼
    │         Executing ──(24 h from start, not Launched)───────────► Refunding
-   │             │  sweeps (B) → create-and-buy (C)   [this milestone]
+   │             │  sweeps (B) → create-and-buy (C)
    │             ▼
-   │          Launched ──► pro-rata (D) ── (stretch) fee split (E)
+   │          Launched ── pro-rata (D) ──► Distributed
+   │                                          (stretch) fee split (E) after D
 ```
 - Defaults (Ethics patterns, re-implemented): cap 1% of target per wallet, deadline set at creation, 24 h execution timeout, 1.5% fill fee to the fee vault (taken from the raise before the buy; MVP may set 0), fee split 70/20/10.
 - `Refunding`: any caller can request Shape A for any registered deposit; also covers deposits that arrive late.

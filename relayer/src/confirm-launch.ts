@@ -1,11 +1,13 @@
 /**
- * Watcher-only: `confirm_transfer(message_hash, solana_sig)` after the
- * launch lands. Moves the trust to Launched and records pool + mint.
+ * Watcher-only: `confirm_launch_outcome(message_hash, solana_sig, tokens_bought)`
+ * after the launch lands. Records the raise-ATA token balance (6-decimal raw
+ * units, JSON string so values above 2^53 survive), pool, and fill fee, then
+ * moves the trust to Launched (or Distributed when every floor share is 0).
  *
  * Refuses unless EXECUTE_CONFIRM_LAUNCH=1.
  *
  * Env: CONTRACT_ID, NEAR_ACCOUNT_ID, NEAR_PRIVATE_KEY,
- *      LAUNCH_MESSAGE_HASH, SOLANA_SIG.
+ *      LAUNCH_MESSAGE_HASH, SOLANA_SIG, TOKENS_BOUGHT.
  */
 import { Account, JsonRpcProvider, KeyPairString, teraToGas } from "near-api-js";
 import { TESTNET_RPC } from "./near-rpc.ts";
@@ -16,10 +18,21 @@ export async function runConfirmLaunch(): Promise<void> {
   const privateKey = process.env.NEAR_PRIVATE_KEY as KeyPairString | undefined;
   const messageHash = process.env.LAUNCH_MESSAGE_HASH;
   const solanaSig = process.env.SOLANA_SIG;
-  if (!contractId || !accountId || !privateKey || !messageHash || !solanaSig) {
+  const tokensBought = process.env.TOKENS_BOUGHT;
+  if (
+    !contractId ||
+    !accountId ||
+    !privateKey ||
+    !messageHash ||
+    !solanaSig ||
+    !tokensBought
+  ) {
     throw new Error(
-      "Set CONTRACT_ID, NEAR_ACCOUNT_ID, NEAR_PRIVATE_KEY, LAUNCH_MESSAGE_HASH, SOLANA_SIG.",
+      "Set CONTRACT_ID, NEAR_ACCOUNT_ID, NEAR_PRIVATE_KEY, LAUNCH_MESSAGE_HASH, SOLANA_SIG, TOKENS_BOUGHT.",
     );
+  }
+  if (!/^[1-9][0-9]*$/.test(tokensBought)) {
+    throw new Error("TOKENS_BOUGHT must be a positive decimal integer (6-decimal raw units).");
   }
 
   if (process.env.EXECUTE_CONFIRM_LAUNCH !== "1") {
@@ -27,10 +40,11 @@ export async function runConfirmLaunch(): Promise<void> {
       JSON.stringify(
         {
           skipped: true,
-          reason: "Set EXECUTE_CONFIRM_LAUNCH=1 to call confirm_transfer.",
+          reason: "Set EXECUTE_CONFIRM_LAUNCH=1 to call confirm_launch_outcome.",
           contractId,
           messageHash,
           solanaSig,
+          tokensBought,
         },
         null,
         2,
@@ -45,12 +59,18 @@ export async function runConfirmLaunch(): Promise<void> {
   const account = new Account(accountId, provider, privateKey);
   const result = await account.callFunction({
     contractId,
-    methodName: "confirm_transfer",
-    args: { message_hash: messageHash, solana_sig: solanaSig },
+    methodName: "confirm_launch_outcome",
+    args: {
+      message_hash: messageHash,
+      solana_sig: solanaSig,
+      tokens_bought: tokensBought,
+    },
     gas: teraToGas(30),
     deposit: 1n,
   });
-  console.log(JSON.stringify({ contractId, messageHash, solanaSig, result }, null, 2));
+  console.log(
+    JSON.stringify({ contractId, messageHash, solanaSig, tokensBought, result }, null, 2),
+  );
 }
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;

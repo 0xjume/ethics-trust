@@ -45,6 +45,18 @@ pub enum ShapeError {
     MissingLaunchIx,
     WrongAccount,
     WrongWrap,
+    WrongAmount,
+    WrongDecimals,
+    WrongOwner,
+    WrongTokenProgram,
+    NotTransferChecked,
+    AtaPayerNotRelayer,
+    FeePayerNotRelayer,
+    ExactData,
+    WrongAccountCount,
+    DuplicateContributor,
+    TooManyTransfers,
+    MessageTooLarge,
 }
 
 impl ShapeError {
@@ -69,7 +81,23 @@ impl ShapeError {
             Self::WrongFillFee => "fill fee transfer is missing or not raise → fee vault",
             Self::MissingLaunchIx => "launch message needs initialize_virtual_pool + swap",
             Self::WrongAccount => "launch instruction account does not match the derived pin",
-            Self::WrongWrap => "wSOL wrap must be raise → raise WSOL ATA for the first-buy amount, then SyncNative",
+            Self::WrongWrap => {
+                "wSOL wrap must be raise → raise WSOL ATA for the first-buy amount, then SyncNative"
+            }
+            Self::WrongAmount => "transfer amount is not the remaining share",
+            Self::WrongDecimals => "TransferChecked decimals are not 6",
+            Self::WrongOwner => "destination owner is not the registered contributor",
+            Self::WrongTokenProgram => {
+                "distribution uses classic SPL Token (Tokenkeg), not Token-2022"
+            }
+            Self::NotTransferChecked => "instruction is not SPL Token TransferChecked",
+            Self::AtaPayerNotRelayer => "ATA payer must be the relayer fee payer",
+            Self::FeePayerNotRelayer => "fee payer must be the relayer, not raise/mint/fee",
+            Self::ExactData => "instruction data length is not exact",
+            Self::WrongAccountCount => "instruction account list length is not exact",
+            Self::DuplicateContributor => "duplicate contributor in distribution",
+            Self::TooManyTransfers => "too many distribution transfers",
+            Self::MessageTooLarge => "message exceeds 1232 bytes",
         }
     }
 }

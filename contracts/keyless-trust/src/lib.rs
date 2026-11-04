@@ -1,8 +1,9 @@
 //! Keyless Trust — NEAR contract that will only sign allowed Solana vault txs.
 //!
-//! Milestone 3: chip-in / refund / sweep plus DBC Shape C launch.
+//! Milestone 4: chip-in / refund / sweep, DBC Shape C launch, pro-rata
+//! Shape D distribution.
 
-use near_sdk::json_types::Base64VecU8;
+use near_sdk::json_types::{Base64VecU8, U64};
 use near_sdk::serde_json::Value;
 use near_sdk::store::{IterableMap, LookupMap};
 use near_sdk::{
@@ -17,16 +18,18 @@ pub mod shapes;
 pub mod solana;
 
 use math::{
-    apply_rent_dust_closeout, fill_fee_lamports, raise_refundable_lamports, refundable_lamports,
-    split_deposit, sweepable_lamports, DEFAULT_FILL_FEE_BPS, EXECUTION_TIMEOUT_NS,
-    PENDING_EXPIRY_NS,
+    apply_rent_dust_closeout, fill_fee_lamports, pro_rata_share, raise_refundable_lamports,
+    refundable_lamports, split_deposit, sweepable_lamports, DEFAULT_FILL_FEE_BPS,
+    EXECUTION_TIMEOUT_NS, MAX_TOKENS_BOUGHT, PENDING_EXPIRY_NS,
 };
 use mpc::{
     contributor_path, derive_path, derived_public_key_promise, sign_eddsa_promise, DOMAIN_ED25519,
     MPC_CALLBACK_GAS, ONE_YOCTO,
 };
+use shapes::dbc::TOKEN_PROGRAM;
 use shapes::{
-    decode_dbc_program, validate_launch, validate_system_transfer, LaunchCheck, TransferCheck,
+    decode_dbc_program, parse_distribute, resolve_owners, validate_launch,
+    validate_system_transfer, LaunchCheck, TransferCheck, MAX_DISTRIBUTE_BATCH, TOKEN_DECIMALS,
 };
 use solana::parse_legacy_message;
 
@@ -51,6 +54,9 @@ pub const SIGN_DEPOSIT: NearToken = NearToken::from_millinear(10);
 /// Caller must attach at least this much gas to `request_launch`: two
 /// MPC `sign` calls (30 TGas each) plus the 20 TGas callback.
 pub const LAUNCH_ATTACH_TGAS: u64 = 90;
+/// One raise-vault MPC `sign` (30 TGas) plus the 20 TGas callback, with
+/// headroom for the Shape D checker. Live direct `sign` burnt 8.84 TGas.
+pub const DISTRIBUTE_ATTACH_TGAS: u64 = 60;
 
 #[near(serializers = [json, borsh])]
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -60,6 +66,9 @@ pub enum TrustState {
     Executing,
     Launched,
     Refunding,
+    /// Every credited contributor has been paid their floor share.
+    /// Rounding dust stays in the raise ATA and is not a share.
+    Distributed,
 }
 
 #[near(serializers = [json, borsh])]
@@ -103,6 +112,12 @@ pub struct Trust {
     pub params_hash: String,
     pub credited_total: u64,
     pub overflow_total: u64,
+    /// Watcher-reported raw token balance of the raise ATA at launch
+    /// confirm. 0 until then. Capped at `MAX_TOKENS_BOUGHT`.
+    pub tokens_bought: u64,
+    /// Sum of floor shares. Dust is `tokens_bought - claimable_total`.
+    pub claimable_total: u64,
+    pub distributed_total: u64,
     pub watcher: AccountId,
     pub state: TrustState,
 }
@@ -133,8 +148,26 @@ pub struct TrustView {
     pub params_hash: String,
     pub credited_total: u64,
     pub overflow_total: u64,
+    pub tokens_bought: u64,
+    pub claimable_total: u64,
+    pub distributed_total: u64,
     pub watcher: AccountId,
     pub state: TrustState,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
+pub struct DistributionStatus {
+    pub trust_id: u64,
+    pub state: TrustState,
+    pub tokens_bought: u64,
+    pub claimable_total: u64,
+    pub distributed_total: u64,
+    /// `tokens_bought - claimable_total`. Stays in the raise ATA.
+    pub dust_tokens: u64,
+    pub decimals: u8,
+    /// Classic SPL Tokenkeg. Shape C never initializes Token-2022.
+    pub token_program: String,
 }
 
 impl From<&Trust> for TrustView {
@@ -163,6 +196,9 @@ impl From<&Trust> for TrustView {
             params_hash: trust.params_hash.clone(),
             credited_total: trust.credited_total,
             overflow_total: trust.overflow_total,
+            tokens_bought: trust.tokens_bought,
+            claimable_total: trust.claimable_total,
+            distributed_total: trust.distributed_total,
             watcher: trust.watcher.clone(),
             state: trust.state.clone(),
         }
@@ -182,6 +218,9 @@ pub struct Contribution {
     pub swept_lamports: u64,
     pub refunded_lamports: u64,
     pub raise_refunded_lamports: u64,
+    /// Raw tokens booked on `confirm_transfer` of a distribute leg.
+    /// Not updated at sign time.
+    pub distributed_tokens: u64,
     pub last_solana_sig: String,
 }
 
@@ -203,7 +242,9 @@ pub struct PendingTransfer {
     /// rows are then superseded.
     pub nonce: u64,
     pub superseded: bool,
-    /// Launch only: `pool_base58:fill_fee_in_tx`. Empty for A/B.
+    /// Launch: `pool_base58:fill_fee_in_tx`. Distribute: comma-separated
+    /// `owner_b58:amount:nonce` legs (base58 has no colon or comma).
+    /// Empty for sweep / refund.
     pub extra: String,
 }
 
@@ -335,7 +376,9 @@ impl Contract {
     }
 
     pub fn get_contribution(&self, trust_id: u64, contributor: String) -> Option<Contribution> {
-        self.ledger.get(&ledger_key(trust_id, &contributor)).cloned()
+        self.ledger
+            .get(&ledger_key(trust_id, &contributor))
+            .cloned()
     }
 
     pub fn derivation_paths(&self, trust_id: u64, solana_pubkey: Option<String>) -> Vec<String> {
@@ -393,14 +436,17 @@ impl Contract {
         self.next_trust_id += 1;
         let cap = config.cap_bps;
         let fill_fee = config.fill_fee_bps.unwrap_or(DEFAULT_FILL_FEE_BPS);
-        let timeout = config
-            .execution_timeout_ns
-            .unwrap_or(EXECUTION_TIMEOUT_NS);
+        let timeout = config.execution_timeout_ns.unwrap_or(EXECUTION_TIMEOUT_NS);
         require!(cap > 0 && cap <= 10_000, "cap_bps out of range");
         require!(fill_fee <= 10_000, "fill_fee_bps out of range");
         require!(timeout > 0, "execution_timeout_ns must be > 0");
 
-        let params_hash = pin_params_hash(&config.dbc_config, &config.name, &config.symbol, &config.uri);
+        let params_hash = pin_params_hash(
+            &config.dbc_config,
+            &config.name,
+            &config.symbol,
+            &config.uri,
+        );
         let trust = Trust {
             id,
             target_lamports: config.target_lamports,
@@ -425,6 +471,9 @@ impl Contract {
             params_hash,
             credited_total: 0,
             overflow_total: 0,
+            tokens_bought: 0,
+            claimable_total: 0,
+            distributed_total: 0,
             watcher: config.watcher,
             state: TrustState::Raising,
         };
@@ -458,7 +507,9 @@ impl Contract {
             .state
             .clone();
         require!(
-            state != TrustState::Launched && state != TrustState::Refunding,
+            state != TrustState::Launched
+                && state != TrustState::Refunding
+                && state != TrustState::Distributed,
             "cannot register after the trust is closed"
         );
         let _ = require_pubkey(&solana_pubkey);
@@ -513,7 +564,7 @@ impl Contract {
             "only the trusted watcher can report deposits"
         );
         require!(
-            state != TrustState::Launched,
+            state != TrustState::Launched && state != TrustState::Distributed,
             "cannot report deposits after launch"
         );
 
@@ -606,12 +657,10 @@ impl Contract {
         let trust = self.trusts.get(&trust_id).expect("unknown trust");
         let state = projected_state(&trust);
         match self.ledger.get(&ledger_key(trust_id, &contributor)) {
-            Some(row) => raise_refundable_lamports(
-                &state,
-                row.swept_lamports,
-                row.raise_refunded_lamports,
-            )
-            .saturating_sub(self.pending_amount(trust_id, &contributor, "raise_refund")),
+            Some(row) => {
+                raise_refundable_lamports(&state, row.swept_lamports, row.raise_refunded_lamports)
+                    .saturating_sub(self.pending_amount(trust_id, &contributor, "raise_refund"))
+            }
             None => 0,
         }
     }
@@ -631,6 +680,37 @@ impl Contract {
 
     pub fn launch_attach_tgas(&self) -> u64 {
         LAUNCH_ATTACH_TGAS
+    }
+
+    /// Gas the caller must attach to `request_distribute` (one 30 TGas
+    /// raise `sign` + 20 TGas callback + checker headroom).
+    pub fn distribute_attach_tgas(&self) -> u64 {
+        DISTRIBUTE_ATTACH_TGAS
+    }
+
+    pub fn max_distribute_batch(&self) -> u64 {
+        MAX_DISTRIBUTE_BATCH as u64
+    }
+
+    /// Remaining floor share, minus tokens already booked and any live
+    /// (unreleased) distribute lock for this contributor.
+    pub fn claimable(&self, trust_id: u64, contributor: String) -> u64 {
+        self.claimable_of(trust_id, &contributor)
+    }
+
+    pub fn distribution_status(&self, trust_id: u64) -> DistributionStatus {
+        let trust = self.trusts.get(&trust_id).expect("unknown trust");
+        let state = projected_state(trust);
+        DistributionStatus {
+            trust_id,
+            state,
+            tokens_bought: trust.tokens_bought,
+            claimable_total: trust.claimable_total,
+            distributed_total: trust.distributed_total,
+            dust_tokens: trust.tokens_bought.saturating_sub(trust.claimable_total),
+            decimals: TOKEN_DECIMALS,
+            token_program: crate::bs58::encode(&TOKEN_PROGRAM),
+        }
     }
 
     pub fn sweepable(&self, trust_id: u64, contributor: String) -> u64 {
@@ -987,15 +1067,141 @@ impl Contract {
         self.sign_launch_tx(raise_path, mint_path, trust_id, &message.0)
     }
 
-    /// Milestone 4 stub. Pro-rata distribution is not implemented here.
-    pub fn request_distribute(&self, _trust_id: u64, _message: Base64VecU8) {
-        env::panic_str("request_distribute is Milestone 4");
+    /// Shape D. Permissionless claim of one contributor's remaining floor
+    /// share, or a batch of up to `max_distribute_batch` shares, from the
+    /// raise vault's token ATA. One raise-vault MPC sign. Books nothing
+    /// until the watcher `confirm_transfer`s. Each contributor has their
+    /// own lock, so a stranger who pays `sign_deposit` (0.01 NEAR, excess
+    /// refunded) can freeze only the contributors included in this message
+    /// for `pending_expiry_ns` (150 s), not the rest of the raise.
+    ///
+    /// A batch locks every included contributor in that one call. That is
+    /// the grief trade-off of batching: at most 5 claims, for one 0.01
+    /// NEAR deposit, for 150 s. Leaving someone out does not freeze them.
+    #[payable]
+    pub fn request_distribute(&mut self, trust_id: u64, message: Base64VecU8) -> Promise {
+        require!(
+            env::attached_deposit() >= SIGN_DEPOSIT,
+            "insufficient storage deposit"
+        );
+        require!(
+            env::prepaid_gas() >= Gas::from_tgas(DISTRIBUTE_ATTACH_TGAS),
+            "attach at least 60 TGas"
+        );
+        let before = self.storage_snapshot();
+        self.apply_timeouts(trust_id);
+        let (state, raise_addr, mint_addr, fee_addr, tokens_bought, raise_path) = {
+            let trust = self.trusts.get(&trust_id).expect("unknown trust");
+            (
+                projected_state(trust),
+                trust.raise_address.clone(),
+                trust.mint_address.clone(),
+                trust.fee_address.clone(),
+                trust.tokens_bought,
+                trust.raise_path.clone(),
+            )
+        };
+        require!(state == TrustState::Launched, "distribute only in Launched");
+        require!(tokens_bought > 0, "tokens bought not recorded");
+        let raise = require_pubkey(
+            raise_addr
+                .as_ref()
+                .expect("raise address not derived; call request_derived_key first"),
+        );
+        let mint = require_pubkey(
+            mint_addr
+                .as_ref()
+                .expect("mint address not derived; call request_derived_key first"),
+        );
+        let fee = require_pubkey(
+            fee_addr
+                .as_ref()
+                .expect("fee address not derived; call request_derived_key first"),
+        );
+        let msg = parse_legacy_message(&message.0).unwrap_or_else(|e| env::panic_str(e.as_str()));
+        let parsed = parse_distribute(&msg, message.0.len(), &raise, &mint, &fee)
+            .unwrap_or_else(|e| env::panic_str(e.as_str()));
+        let mut expected = Vec::with_capacity(parsed.len());
+        for leg in &parsed {
+            let owner_pk = if leg.owner_resolved {
+                self.require_distribute_owner(trust_id, &crate::bs58::encode(&leg.owner));
+                leg.owner
+            } else {
+                let candidates = self.distribute_candidates(trust_id);
+                let owner = candidates.iter().find(|(pk, _)| {
+                    shapes::distribute::derive_ata(pk, &mint, &TOKEN_PROGRAM) == leg.dest
+                });
+                let Some((pk, _)) = owner else {
+                    env::panic_str("destination owner is not the registered contributor");
+                };
+                *pk
+            };
+            let owner = crate::bs58::encode(&owner_pk);
+            let remaining = self.claimable_of(trust_id, &owner);
+            require!(remaining > 0, "nothing to claim");
+            expected.push((owner_pk, remaining));
+        }
+        let legs =
+            resolve_owners(parsed, &mint, &expected).unwrap_or_else(|e| env::panic_str(e.as_str()));
+        let mut locked: Vec<(String, u64)> = Vec::with_capacity(legs.len());
+        for leg in &legs {
+            let owner = crate::bs58::encode(&leg.owner);
+            let remaining = self.claimable_of(trust_id, &owner);
+            require!(remaining > 0, "nothing to claim");
+            require!(
+                leg.amount == remaining,
+                "transfer amount is not the remaining share"
+            );
+            locked.push((owner, leg.amount));
+        }
+        self.lock_distribute(trust_id, &locked, &message.0);
+        self.charge_storage(before, SIGN_DEPOSIT);
+        let total = locked.iter().map(|(_, a)| *a).sum();
+        self.sign_vault_tx(
+            raise_path,
+            trust_id,
+            &locked[0].0,
+            "distribute",
+            total,
+            &message.0,
+        )
     }
 
     /// Watcher reports that the signed Solana tx landed. Settles the pending
-    /// entry keyed by `sha256(message)` hex.
+    /// entry keyed by `sha256(message)` hex. Launch pendings must use
+    /// `confirm_launch_outcome` so `tokens_bought` is recorded in the same
+    /// transaction. Omitting that field here stays valid for sweep, refund,
+    /// fill-fee, and distribute.
     #[payable]
     pub fn confirm_transfer(&mut self, message_hash: String, solana_sig: String) {
+        self.confirm_inner(message_hash, solana_sig, None);
+    }
+
+    /// Launch confirm. Records the raise ATA balance the watcher read after
+    /// the first buy (`1..=MAX_TOKENS_BOUGHT`, 6-decimal raw units, capped
+    /// at the pinned 1B supply). A lying watcher can scale every share down
+    /// (residual stays in the raise ATA) or up to that cap (transfers then
+    /// fail on Solana if the ATA is short). It cannot change who is paid.
+    #[payable]
+    pub fn confirm_launch_outcome(
+        &mut self,
+        message_hash: String,
+        solana_sig: String,
+        tokens_bought: U64,
+    ) {
+        // `U64` accepts a JSON string, so a 6-decimal supply above 2^53
+        // round-trips. `confirm_transfer` stays two arguments: near-sdk
+        // 5.17 does not default a missing `Option`, and a third field
+        // would break sweep / refund confirms.
+        self.confirm_inner(message_hash, solana_sig, Some(tokens_bought.0));
+    }
+
+    fn confirm_inner(
+        &mut self,
+        message_hash: String,
+        solana_sig: String,
+        tokens_bought: Option<u64>,
+    ) {
         require!(env::attached_deposit() >= ONE_YOCTO, "attach 1 yoctoNEAR");
         require!(
             solana_sig.len() >= 64 && solana_sig.len() <= 128,
@@ -1013,9 +1219,42 @@ impl Contract {
         require!(!pending.settled, "pending already settled");
         require!(!pending.superseded, "pending superseded");
         self.apply_timeouts(pending.trust_id);
-        let lk = lock_key(pending.trust_id, &pending.contributor, &pending.kind);
-        let current_nonce = self.lock_nonces.get(&lk).copied().unwrap_or(0);
-        require!(pending.nonce == current_nonce, "pending superseded");
+        if pending.kind == "launch" {
+            let tokens = tokens_bought
+                .unwrap_or_else(|| env::panic_str("tokens_bought required to confirm launch"));
+            require!(
+                tokens > 0 && tokens <= MAX_TOKENS_BOUGHT,
+                "tokens_bought out of range"
+            );
+        } else {
+            require!(
+                tokens_bought.is_none(),
+                "tokens_bought only on launch confirm"
+            );
+        }
+        if pending.kind == "distribute" {
+            for leg in parse_distribute_extra(&pending.extra) {
+                let lk = lock_key(pending.trust_id, &leg.contributor, "distribute");
+                let current = self.lock_nonces.get(&lk).copied().unwrap_or(0);
+                require!(leg.nonce == current, "pending superseded");
+                if pending.released {
+                    let remaining = self.claimable_of(pending.trust_id, &leg.contributor);
+                    require!(leg.amount <= remaining, "amount exceeds remaining budget");
+                }
+            }
+        } else {
+            let lk = lock_key(pending.trust_id, &pending.contributor, &pending.kind);
+            let current_nonce = self.lock_nonces.get(&lk).copied().unwrap_or(0);
+            require!(pending.nonce == current_nonce, "pending superseded");
+            if pending.released {
+                let remaining =
+                    self.remaining_budget(pending.trust_id, &pending.contributor, &pending.kind);
+                require!(
+                    pending.lamports <= remaining,
+                    "amount exceeds remaining budget"
+                );
+            }
+        }
         require!(
             self.seen_sigs.get(&solana_sig).is_none(),
             "solana_sig already used"
@@ -1030,18 +1269,7 @@ impl Contract {
             env::predecessor_account_id() == watcher,
             "only the trusted watcher can confirm transfers"
         );
-        if pending.released {
-            let remaining = self.remaining_budget(
-                pending.trust_id,
-                &pending.contributor,
-                &pending.kind,
-            );
-            require!(
-                pending.lamports <= remaining,
-                "amount exceeds remaining budget"
-            );
-        }
-        self.settle_pending(&pending, &solana_sig);
+        self.settle_pending(&pending, &solana_sig, tokens_bought);
     }
 
     /// Anyone may release an expired, unsettled pending so the balance can
@@ -1062,8 +1290,19 @@ impl Contract {
         );
         pending.released = true;
         self.pending.insert(message_hash.clone(), pending.clone());
-        self.last_released
-            .insert(lock_key(pending.trust_id, &pending.contributor, &pending.kind), message_hash);
+        if pending.kind == "distribute" {
+            for leg in parse_distribute_extra(&pending.extra) {
+                self.last_released.insert(
+                    lock_key(pending.trust_id, &leg.contributor, "distribute"),
+                    message_hash.clone(),
+                );
+            }
+        } else {
+            self.last_released.insert(
+                lock_key(pending.trust_id, &pending.contributor, &pending.kind),
+                message_hash,
+            );
+        }
         self.clear_lock(&pending);
     }
 
@@ -1192,6 +1431,7 @@ impl Contract {
             swept_lamports: 0,
             refunded_lamports: 0,
             raise_refunded_lamports: 0,
+            distributed_tokens: 0,
             last_solana_sig: String::new(),
         };
         self.ledger.insert(key, row.clone());
@@ -1229,7 +1469,7 @@ impl Contract {
                     }
                 }
             }
-            TrustState::Launched | TrustState::Refunding => {}
+            TrustState::Launched | TrustState::Refunding | TrustState::Distributed => {}
         }
     }
 
@@ -1273,7 +1513,9 @@ impl Contract {
         let path = if kind == "in" {
             contributor_path(
                 trust_id,
-                contributor.as_deref().expect("contributor required for kind=in"),
+                contributor
+                    .as_deref()
+                    .expect("contributor required for kind=in"),
             )
         } else {
             derive_path(trust_id, kind)
@@ -1290,9 +1532,67 @@ impl Contract {
             return 0;
         };
         match self.pending.get(hash) {
-            Some(p) if !p.settled && !p.released => p.lamports,
+            Some(p) if !p.settled && !p.released => {
+                if kind == "distribute" {
+                    distribute_leg_amount(&p.extra, contributor)
+                } else {
+                    p.lamports
+                }
+            }
             _ => 0,
         }
+    }
+
+    fn claimable_of(&self, trust_id: u64, contributor: &str) -> u64 {
+        let Some(trust) = self.trusts.get(&trust_id) else {
+            return 0;
+        };
+        if projected_state(trust) != TrustState::Launched {
+            return 0;
+        }
+        let Some(row) = self.ledger.get(&ledger_key(trust_id, contributor)) else {
+            return 0;
+        };
+        let share = pro_rata_share(
+            trust.tokens_bought,
+            row.credited_lamports,
+            trust.credited_total,
+        );
+        let pending = self.pending_amount(trust_id, contributor, "distribute");
+        share
+            .saturating_sub(row.distributed_tokens)
+            .saturating_sub(pending)
+    }
+
+    fn require_distribute_owner(&self, trust_id: u64, owner: &str) {
+        require!(
+            self.ledger.get(&ledger_key(trust_id, owner)).is_some(),
+            "destination owner is not the registered contributor"
+        );
+    }
+
+    fn distribute_candidates(&self, trust_id: u64) -> Vec<([u8; 32], u64)> {
+        self.ledger
+            .values()
+            .filter(|row| row.trust_id == trust_id && row.credited_lamports > 0)
+            .filter_map(|row| {
+                let pk = crate::bs58::decode_pubkey(&row.contributor).ok()?;
+                Some((pk, row.credited_lamports))
+            })
+            .collect()
+    }
+
+    fn sum_shares(&self, trust_id: u64, tokens: u64, credited_total: u64) -> u64 {
+        self.ledger
+            .values()
+            .filter(|row| row.trust_id == trust_id)
+            .fold(0u64, |acc, row| {
+                acc.saturating_add(pro_rata_share(
+                    tokens,
+                    row.credited_lamports,
+                    credited_total,
+                ))
+            })
     }
 
     fn lock_pending(
@@ -1318,7 +1618,12 @@ impl Contract {
         );
         let lk = lock_key(trust_id, contributor, kind);
         self.supersede_released(&lk);
-        let nonce = self.lock_nonces.get(&lk).copied().unwrap_or(0).saturating_add(1);
+        let nonce = self
+            .lock_nonces
+            .get(&lk)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
         self.lock_nonces.insert(lk.clone(), nonce);
         let pending = PendingTransfer {
             trust_id,
@@ -1337,6 +1642,64 @@ impl Contract {
         self.locks.insert(lk, message_hash);
     }
 
+    fn lock_distribute(&mut self, trust_id: u64, legs: &[(String, u64)], message: &[u8]) {
+        require!(!legs.is_empty(), "message has no instructions");
+        for (contributor, _) in legs {
+            require!(
+                self.pending_amount(trust_id, contributor, "distribute") == 0,
+                "transfer already pending"
+            );
+        }
+        let message_hash = hex::encode(env::sha256(message));
+        require!(
+            self.consumed_hashes.get(&message_hash).is_none(),
+            "message already settled"
+        );
+        require!(
+            self.pending.get(&message_hash).is_none(),
+            "message hash already pending"
+        );
+        let mut stored = Vec::with_capacity(legs.len());
+        for (contributor, amount) in legs {
+            let lk = lock_key(trust_id, contributor, "distribute");
+            self.supersede_released(&lk);
+            let nonce = self
+                .lock_nonces
+                .get(&lk)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            self.lock_nonces.insert(lk, nonce);
+            stored.push(DistPendingLeg {
+                contributor: contributor.clone(),
+                amount: *amount,
+                nonce,
+            });
+        }
+        let extra = format_distribute_extra(&stored);
+        let total = legs.iter().map(|(_, a)| *a).sum();
+        let pending = PendingTransfer {
+            trust_id,
+            contributor: stored[0].contributor.clone(),
+            kind: "distribute".to_string(),
+            lamports: total,
+            message_hash: message_hash.clone(),
+            expires_at_ns: env::block_timestamp().saturating_add(PENDING_EXPIRY_NS),
+            settled: false,
+            released: false,
+            nonce: stored[0].nonce,
+            superseded: false,
+            extra,
+        };
+        self.pending.insert(message_hash.clone(), pending);
+        for leg in &stored {
+            self.locks.insert(
+                lock_key(trust_id, &leg.contributor, "distribute"),
+                message_hash.clone(),
+            );
+        }
+    }
+
     fn supersede_released(&mut self, lk: &str) {
         let Some(old) = self.last_released.get(lk).cloned() else {
             return;
@@ -1348,15 +1711,24 @@ impl Contract {
     }
 
     fn revert_lock_nonce(&mut self, pending: &PendingTransfer) {
-        let lk = lock_key(pending.trust_id, &pending.contributor, &pending.kind);
-        if self.lock_nonces.get(&lk).copied() == Some(pending.nonce) {
-            self.lock_nonces
-                .insert(lk.clone(), pending.nonce.saturating_sub(1));
-        }
-        if let Some(old) = self.last_released.get(&lk).cloned() {
-            if let Some(mut prev) = self.pending.get(&old).cloned() {
-                prev.superseded = false;
-                self.pending.insert(old, prev);
+        let legs = if pending.kind == "distribute" {
+            parse_distribute_extra(&pending.extra)
+                .into_iter()
+                .map(|leg| (leg.contributor, leg.nonce))
+                .collect()
+        } else {
+            vec![(pending.contributor.clone(), pending.nonce)]
+        };
+        for (contributor, nonce) in legs {
+            let lk = lock_key(pending.trust_id, &contributor, &pending.kind);
+            if self.lock_nonces.get(&lk).copied() == Some(nonce) {
+                self.lock_nonces.insert(lk.clone(), nonce.saturating_sub(1));
+            }
+            if let Some(old) = self.last_released.get(&lk).cloned() {
+                if let Some(mut prev) = self.pending.get(&old).cloned() {
+                    prev.superseded = false;
+                    self.pending.insert(old, prev);
+                }
             }
         }
     }
@@ -1373,9 +1745,7 @@ impl Contract {
             }
             "launch" => {
                 let trust = self.trusts.get(&trust_id).expect("unknown trust");
-                if projected_state(trust) != TrustState::Executing
-                    || trust.pool_address.is_some()
-                {
+                if projected_state(trust) != TrustState::Executing || trust.pool_address.is_some() {
                     0
                 } else {
                     let fee = fill_fee_lamports(trust.credited_total, trust.fill_fee_bps);
@@ -1386,7 +1756,12 @@ impl Contract {
         }
     }
 
-    fn settle_pending(&mut self, pending: &PendingTransfer, solana_sig: &str) {
+    fn settle_pending(
+        &mut self,
+        pending: &PendingTransfer,
+        solana_sig: &str,
+        tokens_bought: Option<u64>,
+    ) {
         match pending.kind.as_str() {
             "sweep" | "refund" | "raise_refund" => {
                 let key = ledger_key(pending.trust_id, &pending.contributor);
@@ -1440,13 +1815,50 @@ impl Contract {
                 }
             }
             "launch" => {
+                let tokens = tokens_bought
+                    .unwrap_or_else(|| env::panic_str("tokens_bought required to confirm launch"));
+                require!(
+                    tokens > 0 && tokens <= MAX_TOKENS_BOUGHT,
+                    "tokens_bought out of range"
+                );
+                let credited_total = self
+                    .trusts
+                    .get(&pending.trust_id)
+                    .expect("unknown trust")
+                    .credited_total;
+                let claimable_total = self.sum_shares(pending.trust_id, tokens, credited_total);
                 if let Some(trust) = self.trusts.get_mut(&pending.trust_id) {
-                    trust.state = TrustState::Launched;
+                    trust.tokens_bought = tokens;
+                    trust.claimable_total = claimable_total;
+                    trust.distributed_total = 0;
+                    trust.state = if claimable_total == 0 {
+                        TrustState::Distributed
+                    } else {
+                        TrustState::Launched
+                    };
                     let (pool, fee_in_tx) = parse_launch_extra(&pending.extra);
                     if let Some(pool) = pool {
                         trust.pool_address = Some(pool);
                     }
                     trust.fill_fee_paid = trust.fill_fee_paid.saturating_add(fee_in_tx);
+                }
+            }
+            "distribute" => {
+                let legs = parse_distribute_extra(&pending.extra);
+                let mut booked = 0u64;
+                for leg in &legs {
+                    let key = ledger_key(pending.trust_id, &leg.contributor);
+                    let row = self.ledger.get_mut(&key).expect("unknown contributor");
+                    row.distributed_tokens = row.distributed_tokens.saturating_add(leg.amount);
+                    row.last_solana_sig = solana_sig.to_string();
+                    booked = booked.saturating_add(leg.amount);
+                }
+                if let Some(trust) = self.trusts.get_mut(&pending.trust_id) {
+                    trust.distributed_total = trust.distributed_total.saturating_add(booked);
+                    if trust.distributed_total >= trust.claimable_total && trust.claimable_total > 0
+                    {
+                        trust.state = TrustState::Distributed;
+                    }
                 }
             }
             _ => env::panic_str("unknown pending kind"),
@@ -1457,14 +1869,27 @@ impl Contract {
             .insert(pending.message_hash.clone(), pending.trust_id);
         self.pending.remove(&pending.message_hash);
         self.clear_lock(pending);
-        let lk = lock_key(pending.trust_id, &pending.contributor, &pending.kind);
-        if self
-            .last_released
-            .get(&lk)
-            .map(|h| h == &pending.message_hash)
-            .unwrap_or(false)
-        {
-            self.last_released.remove(&lk);
+        let lock_ids = if pending.kind == "distribute" {
+            parse_distribute_extra(&pending.extra)
+                .into_iter()
+                .map(|leg| lock_key(pending.trust_id, &leg.contributor, "distribute"))
+                .collect()
+        } else {
+            vec![lock_key(
+                pending.trust_id,
+                &pending.contributor,
+                &pending.kind,
+            )]
+        };
+        for lk in lock_ids {
+            if self
+                .last_released
+                .get(&lk)
+                .map(|h| h == &pending.message_hash)
+                .unwrap_or(false)
+            {
+                self.last_released.remove(&lk);
+            }
         }
     }
 
@@ -1512,14 +1937,27 @@ impl Contract {
     }
 
     fn clear_lock(&mut self, pending: &PendingTransfer) {
-        let lk = lock_key(pending.trust_id, &pending.contributor, &pending.kind);
-        if self
-            .locks
-            .get(&lk)
-            .map(|h| h == &pending.message_hash)
-            .unwrap_or(false)
-        {
-            self.locks.remove(&lk);
+        let keys = if pending.kind == "distribute" {
+            parse_distribute_extra(&pending.extra)
+                .into_iter()
+                .map(|leg| lock_key(pending.trust_id, &leg.contributor, "distribute"))
+                .collect()
+        } else {
+            vec![lock_key(
+                pending.trust_id,
+                &pending.contributor,
+                &pending.kind,
+            )]
+        };
+        for lk in keys {
+            if self
+                .locks
+                .get(&lk)
+                .map(|h| h == &pending.message_hash)
+                .unwrap_or(false)
+            {
+                self.locks.remove(&lk);
+            }
         }
     }
 
@@ -1582,22 +2020,65 @@ impl Contract {
     ) -> Promise {
         let payload_hex = hex::encode(message);
         let message_hash_hex = hex::encode(env::sha256(message));
-        sign_eddsa_promise(
-            self.mpc_contract.clone(),
-            raise_path,
-            payload_hex.clone(),
-        )
-        .and(sign_eddsa_promise(
-            self.mpc_contract.clone(),
-            mint_path,
-            payload_hex,
-        ))
-        .then(
-            Self::ext(env::current_account_id())
-                .with_static_gas(MPC_CALLBACK_GAS)
-                .on_launch_signatures(trust_id, message_hash_hex),
-        )
+        sign_eddsa_promise(self.mpc_contract.clone(), raise_path, payload_hex.clone())
+            .and(sign_eddsa_promise(
+                self.mpc_contract.clone(),
+                mint_path,
+                payload_hex,
+            ))
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(MPC_CALLBACK_GAS)
+                    .on_launch_signatures(trust_id, message_hash_hex),
+            )
     }
+}
+
+struct DistPendingLeg {
+    contributor: String,
+    amount: u64,
+    nonce: u64,
+}
+
+fn format_distribute_extra(legs: &[DistPendingLeg]) -> String {
+    legs.iter()
+        .map(|leg| format!("{}:{}:{}", leg.contributor, leg.amount, leg.nonce))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_distribute_extra(extra: &str) -> Vec<DistPendingLeg> {
+    require!(!extra.is_empty(), "bad distribute pending");
+    extra
+        .split(',')
+        .map(|part| {
+            let mut it = part.split(':');
+            let contributor = it.next().unwrap_or("").to_string();
+            let amount = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| env::panic_str("bad distribute pending"));
+            let nonce = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| env::panic_str("bad distribute pending"));
+            require!(it.next().is_none(), "bad distribute pending");
+            require!(!contributor.is_empty(), "bad distribute pending");
+            DistPendingLeg {
+                contributor,
+                amount,
+                nonce,
+            }
+        })
+        .collect()
+}
+
+fn distribute_leg_amount(extra: &str, contributor: &str) -> u64 {
+    parse_distribute_extra(extra)
+        .into_iter()
+        .find(|leg| leg.contributor == contributor)
+        .map(|leg| leg.amount)
+        .unwrap_or(0)
 }
 
 fn parse_launch_extra(extra: &str) -> (Option<String>, u64) {
@@ -1613,11 +2094,11 @@ fn parse_launch_extra(extra: &str) -> (Option<String>, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::RENT_EXEMPT_MIN;
+    use crate::shapes::SYSTEM_PROGRAM;
     use crate::solana::message::{
         serialize_legacy_message, CompiledInstruction, LegacyMessage, MessageHeader,
     };
-    use crate::math::RENT_EXEMPT_MIN;
-    use crate::shapes::SYSTEM_PROGRAM;
     use near_sdk::test_utils::{accounts, VMContextBuilder};
     use near_sdk::testing_env;
 
@@ -1625,10 +2106,14 @@ mod tests {
     const DEPOSIT_ADDR: &str = "F1aZA8xz3ueSpV5CQFB8PGz8y5QXZZtFdZJRTcZQ8DR6";
     const RAISE_ADDR: &str = "B4paagQ87U6kmpn3AoXYaZMQVsFCJbZtjh8tBoKDDXwj";
     const OTHER_VAULT: &str = "7bjnioap6J85RWuqPn2CEFRJSSMGvm6CGDR5SsxvxfLa";
-    const SIG_A: &str = "32cEnng3NKyCv2VLQ47M2uXnVDp1LZH7B7rtWZtzHDP2QHz6yrEbFJw7kyWerMs1CYZ2vMoa3cgrcKmKkGNgbd9G";
-    const SIG_B: &str = "2wBCwpDikerJ7WiYNu4pRGkyP2QTD5EvHg6mFgnvyw2Q291M72Lpj542ZXnAcxewghaGo14cEg6KHiRZKjtVTMza";
-    const SIG_C: &str = "2UwjXHH8ochhUvGhnDx7pSYDwJWUBdsLkav6yEShNXjqWNqMafUTqvU8fu23QEUKWErME8bqY42cvQoU9XEPWr8A";
-    const SIG_D: &str = "452rHV4vsvxXjAYKXceyeQYmiavoLfAtBbj14kWi9Xdr6S6NCWbRtN9a6WsCi5NLprEiBSeBXdNLhVQKezo6pr9e";
+    const SIG_A: &str =
+        "32cEnng3NKyCv2VLQ47M2uXnVDp1LZH7B7rtWZtzHDP2QHz6yrEbFJw7kyWerMs1CYZ2vMoa3cgrcKmKkGNgbd9G";
+    const SIG_B: &str =
+        "2wBCwpDikerJ7WiYNu4pRGkyP2QTD5EvHg6mFgnvyw2Q291M72Lpj542ZXnAcxewghaGo14cEg6KHiRZKjtVTMza";
+    const SIG_C: &str =
+        "2UwjXHH8ochhUvGhnDx7pSYDwJWUBdsLkav6yEShNXjqWNqMafUTqvU8fu23QEUKWErME8bqY42cvQoU9XEPWr8A";
+    const SIG_D: &str =
+        "452rHV4vsvxXjAYKXceyeQYmiavoLfAtBbj14kWi9Xdr6S6NCWbRtN9a6WsCi5NLprEiBSeBXdNLhVQKezo6pr9e";
     const PAID: NearToken = NearToken::from_millinear(10);
 
     fn context(predecessor: AccountId, deposit: NearToken) -> VMContextBuilder {
@@ -2267,12 +2752,7 @@ mod tests {
         testing_env!(context(accounts(2), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(bytes.clone()));
         let hash = message_hash(&bytes);
-        testing_env!(context_at(
-            accounts(2),
-            PAID,
-            1_000 + PENDING_EXPIRY_NS + 1
-        )
-        .build());
+        testing_env!(context_at(accounts(2), PAID, 1_000 + PENDING_EXPIRY_NS + 1).build());
         c.confirm_transfer(hash.clone(), SIG_D.into());
         assert!(c.get_pending(hash.clone()).is_none());
         assert!(c.is_consumed(hash));
@@ -2328,12 +2808,7 @@ mod tests {
         testing_env!(context(accounts(2), PAID).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(first));
         let second = relayer_paid_bytes([7u8; 32], deposit_bytes(), raise_bytes(), 10);
-        testing_env!(context_at(
-            accounts(2),
-            PAID,
-            1_000 + PENDING_EXPIRY_NS + 1
-        )
-        .build());
+        testing_env!(context_at(accounts(2), PAID, 1_000 + PENDING_EXPIRY_NS + 1).build());
         let _ = c.request_sweep(id, DEMO_PUBKEY.into(), Base64VecU8(second));
     }
 
@@ -2616,12 +3091,7 @@ mod tests {
         expire_and_release(&mut c, &first_hash);
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Refunding);
         let second = relayer_paid_bytes([7u8; 32], deposit_bytes(), owner_bytes(), 50);
-        testing_env!(context_at(
-            accounts(1),
-            PAID,
-            1_000 + PENDING_EXPIRY_NS + 1
-        )
-        .build());
+        testing_env!(context_at(accounts(1), PAID, 1_000 + PENDING_EXPIRY_NS + 1).build());
         let _ = c.request_refund(id, DEMO_PUBKEY.into(), Base64VecU8(second.clone()));
         testing_env!(context(accounts(2), PAID).build());
         c.confirm_transfer(message_hash(&second), SIG_D.into());
@@ -2677,8 +3147,10 @@ mod tests {
         assert!(c.get_pending(first_hash).unwrap().superseded);
     }
 
-    const SIG_E: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    const SIG_F: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const SIG_E: &str =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const SIG_F: &str =
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
     #[test]
     fn request_launch_after_sweep_moves_to_launched() {
@@ -2698,9 +3170,12 @@ mod tests {
         assert_eq!(pending.kind, "launch");
         assert_eq!(pending.lamports, 985);
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
-        c.confirm_transfer(hash, SIG_E.into());
+        c.confirm_launch_outcome(hash, SIG_E.into(), U64(1_000_000));
         let trust = c.get_trust(id).unwrap();
         assert_eq!(trust.state, TrustState::Launched);
+        assert_eq!(trust.tokens_bought, 1_000_000);
+        assert_eq!(trust.claimable_total, 1_000_000);
+        assert_eq!(trust.distributed_total, 0);
         assert_eq!(
             trust.pool_address.as_deref(),
             Some(
@@ -2794,20 +3269,388 @@ mod tests {
         testing_env!(context(accounts(2), PAID).build());
         let _ = c.request_launch(id, Base64VecU8(paid.clone()));
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
-        c.confirm_transfer(message_hash(&paid), SIG_F.into());
+        c.confirm_launch_outcome(message_hash(&paid), SIG_F.into(), U64(1_000_000));
         let trust = c.get_trust(id).unwrap();
         assert_eq!(trust.state, TrustState::Launched);
         assert_eq!(trust.fill_fee_paid, 15);
         assert!(trust.pool_address.is_some());
     }
 
+    fn pk(tag: u8) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[0] = tag;
+        k[31] = tag;
+        k
+    }
+
+    fn pk_b58(tag: u8) -> String {
+        crate::bs58::encode(&pk(tag))
+    }
+
+    fn seed_in(c: &mut Contract, id: u64, contributor: &str, addr: &str) {
+        let _ = c.on_derived_public_key(
+            id,
+            "in".into(),
+            Some(contributor.into()),
+            Ok(format!("ed25519:{addr}")),
+        );
+    }
+
+    /// Two credited contributors, sweeps settled, launch confirmed.
+    /// Credits are `amounts` (must sum to `target`). `tokens` is the
+    /// watcher-reported raise-ATA balance.
+    fn go_launched_split(
+        c: &mut Contract,
+        target: u64,
+        amounts: &[(u8, u64)],
+        tokens: u64,
+        with_fee: bool,
+    ) -> u64 {
+        let id = c.create_trust(fill_config(target, 9_000));
+        seed_raise(c, id);
+        seed_mint(c, id);
+        testing_env!(context(accounts(1), c.register_deposit()).build());
+        let _ = c.register(id, pk_b58(13));
+        let mut reported = Vec::new();
+        for (i, (tag, amount)) in amounts.iter().enumerate() {
+            let contributor = pk_b58(*tag);
+            let deposit = pk_b58(100 + *tag);
+            let report_sig = format!("{:0>88}", (i as u8) + 1);
+            testing_env!(context(accounts(2), PAID).build());
+            c.report_deposit(id, contributor.clone(), *amount, report_sig);
+            seed_in(c, id, &contributor, &deposit);
+            reported.push((*tag, *amount, contributor));
+        }
+        for (i, (tag, amount, contributor)) in reported.iter().enumerate() {
+            let bytes = relayer_paid_bytes([8u8; 32], pk(100 + *tag), raise_bytes(), *amount);
+            testing_env!(context(accounts(2), PAID).build());
+            let _ = c.request_sweep(id, contributor.clone(), Base64VecU8(bytes.clone()));
+            testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
+            let confirm_sig = format!("{:0>86}{}S", i + 1, "C");
+            c.confirm_transfer(message_hash(&bytes), confirm_sig);
+        }
+        let fee = c.fill_fee(id);
+        let _ = with_fee;
+        let buy = target - fee;
+        let bytes = crate::shapes::dbc::tests::fixture_launch_bytes(
+            [8u8; 32],
+            raise_bytes(),
+            mint_bytes(),
+            fee_bytes(),
+            config_bytes(),
+            pool_bytes(),
+            buy,
+            fee,
+            "Demo",
+            "DEMO",
+            "https://example.com/m.json",
+        );
+        testing_env!(context(accounts(2), PAID).build());
+        let _ = c.request_launch(id, Base64VecU8(bytes.clone()));
+        testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
+        c.confirm_launch_outcome(message_hash(&bytes), format!("{:0>88}", 90u8), U64(tokens));
+        id
+    }
+
+    fn dist_bytes(owners: &[([u8; 32], u64)], create: bool) -> Vec<u8> {
+        let legs: Vec<([u8; 32], u64, bool)> =
+            owners.iter().map(|(o, a)| (*o, *a, create)).collect();
+        crate::shapes::build_distribute_message(
+            [8u8; 32],
+            raise_bytes(),
+            mint_bytes(),
+            &legs,
+            pk(9),
+        )
+    }
+
     #[test]
-    #[should_panic(expected = "request_distribute is Milestone 4")]
-    fn request_distribute_is_stub() {
+    fn honest_single_claim_books_on_confirm_and_completes() {
         testing_env!(context(accounts(1), NearToken::from_near(1)).build());
         let mut c = Contract::new(None, None);
-        let id = open_trust(&mut c, 1_000, 9_000);
-        c.request_distribute(id, Base64VecU8(vec![1, 2, 3]));
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 1_000_000, true);
+        assert_eq!(c.get_trust(id).unwrap().state, TrustState::Launched);
+        let owner = pk_b58(11);
+        assert_eq!(c.claimable(id, owner.clone()), 1_000_000);
+        let bytes = dist_bytes(&[(pk(11), 1_000_000)], true);
+        assert!(bytes.len() <= 1232);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
+        assert_eq!(
+            c.get_contribution(id, owner.clone())
+                .unwrap()
+                .distributed_tokens,
+            0
+        );
+        assert_eq!(c.claimable(id, owner.clone()), 0);
+        assert_eq!(c.get_trust(id).unwrap().distributed_total, 0);
+        testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
+        c.confirm_transfer(message_hash(&bytes), format!("{:0>88}", 91u8));
+        assert_eq!(
+            c.get_contribution(id, owner.clone())
+                .unwrap()
+                .distributed_tokens,
+            1_000_000
+        );
+        let trust = c.get_trust(id).unwrap();
+        assert_eq!(trust.state, TrustState::Distributed);
+        assert_eq!(trust.distributed_total, 1_000_000);
+        assert_eq!(c.distribution_status(id).dust_tokens, 0);
+        assert_eq!(c.claimable(id, owner), 0);
+    }
+
+    #[test]
+    fn honest_batch_pays_both_and_records_dust() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        // credits 1 and 2, tokens 100 → floors 33 and 66, dust 1.
+        // fill fee on 3 lamports is 0.
+        let id = go_launched_split(&mut c, 3, &[(11, 1), (12, 2)], 100, false);
+        assert_eq!(c.claimable(id, pk_b58(11)), 33);
+        assert_eq!(c.claimable(id, pk_b58(12)), 66);
+        let status = c.distribution_status(id);
+        assert_eq!(status.dust_tokens, 1);
+        assert_eq!(status.decimals, 6);
+        assert_eq!(status.claimable_total, 99);
+        let bytes = dist_bytes(&[(pk(11), 33), (pk(12), 66)], true);
+        testing_env!(context(accounts(4), c.sign_deposit()).build());
+        let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
+        // The other contributor is inside the batch, so a second claim is locked.
+        assert_eq!(c.claimable(id, pk_b58(12)), 0);
+        testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
+        c.confirm_transfer(message_hash(&bytes), format!("{:0>88}", 92u8));
+        let trust = c.get_trust(id).unwrap();
+        assert_eq!(trust.state, TrustState::Distributed);
+        assert_eq!(trust.distributed_total, 99);
+        assert_eq!(
+            c.get_contribution(id, pk_b58(11))
+                .unwrap()
+                .distributed_tokens,
+            33
+        );
+        assert_eq!(
+            c.get_contribution(id, pk_b58(12))
+                .unwrap()
+                .distributed_tokens,
+            66
+        );
+    }
+
+    #[test]
+    fn one_contributor_lock_does_not_block_the_other() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 600), (12, 400)], 100, true);
+        assert_eq!(c.claimable(id, pk_b58(11)), 60);
+        assert_eq!(c.claimable(id, pk_b58(12)), 40);
+        let first = dist_bytes(&[(pk(11), 60)], false);
+        testing_env!(context(accounts(4), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(first));
+        let second = dist_bytes(&[(pk(12), 40)], true);
+        testing_env!(context(accounts(5), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(second.clone()));
+        testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
+        c.confirm_transfer(message_hash(&second), format!("{:0>88}", 93u8));
+        assert_eq!(
+            c.get_contribution(id, pk_b58(12))
+                .unwrap()
+                .distributed_tokens,
+            40
+        );
+        assert_eq!(c.get_trust(id).unwrap().state, TrustState::Launched);
+    }
+
+    #[test]
+    fn late_confirm_without_resign_still_books() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 50, true);
+        let bytes = dist_bytes(&[(pk(11), 50)], true);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
+        let hash = message_hash(&bytes);
+        expire_and_release(&mut c, &hash);
+        testing_env!(context_at(
+            accounts(2),
+            NearToken::from_yoctonear(1),
+            1_000 + PENDING_EXPIRY_NS + 1
+        )
+        .build());
+        c.confirm_transfer(hash, format!("{:0>88}", 94u8));
+        assert_eq!(
+            c.get_contribution(id, pk_b58(11))
+                .unwrap()
+                .distributed_tokens,
+            50
+        );
+        assert_eq!(c.get_trust(id).unwrap().state, TrustState::Distributed);
+    }
+
+    #[test]
+    #[should_panic(expected = "pending superseded")]
+    fn release_then_resign_rejects_the_old_confirm() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 50, true);
+        let first = dist_bytes(&[(pk(11), 50)], true);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(first.clone()));
+        let first_hash = message_hash(&first);
+        expire_and_release(&mut c, &first_hash);
+        let second = dist_bytes(&[(pk(11), 50)], false);
+        testing_env!(context_at(accounts(3), PAID, 1_000 + PENDING_EXPIRY_NS + 1).build());
+        let _ = c.request_distribute(id, Base64VecU8(second.clone()));
+        testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
+        c.confirm_transfer(message_hash(&second), format!("{:0>88}", 95u8));
+        assert_eq!(
+            c.get_contribution(id, pk_b58(11))
+                .unwrap()
+                .distributed_tokens,
+            50
+        );
+        c.confirm_transfer(first_hash, format!("{:0>88}", 96u8));
+    }
+
+    #[test]
+    #[should_panic(expected = "distribute only in Launched")]
+    fn double_claim_after_confirm_is_rejected() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 80, true);
+        let bytes = dist_bytes(&[(pk(11), 80)], true);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(bytes.clone()));
+        testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
+        c.confirm_transfer(message_hash(&bytes), format!("{:0>88}", 97u8));
+        let again = dist_bytes(&[(pk(11), 80)], false);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(again));
+    }
+
+    #[test]
+    #[should_panic(expected = "distribute only in Launched")]
+    fn claim_before_launched_is_rejected() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = open_fillable(&mut c, 1_000, 9_000);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(vec![1, 2, 3]));
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing to claim")]
+    fn zero_credit_claim_is_rejected() {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 100, true);
+        assert_eq!(
+            c.get_contribution(id, pk_b58(13))
+                .unwrap()
+                .credited_lamports,
+            0
+        );
+        let bytes = dist_bytes(&[(pk(13), 1)], true);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(bytes));
+    }
+
+    fn launched_for_rejects() -> (Contract, u64) {
+        testing_env!(context(accounts(1), NearToken::from_near(1)).build());
+        let mut c = Contract::new(None, None);
+        let id = go_launched_split(&mut c, 1_000, &[(11, 1_000)], 100, true);
+        (c, id)
+    }
+
+    fn try_dist(bytes: Vec<u8>) {
+        let (mut c, id) = launched_for_rejects();
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(bytes));
+    }
+
+    #[test]
+    #[should_panic(expected = "destination owner is not the registered contributor")]
+    fn rejects_wrong_destination_owner() {
+        let bytes = dist_bytes(&[(pk(19), 100)], true);
+        try_dist(bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "base mint is not the derived trust/<id>/mint key")]
+    fn rejects_wrong_mint() {
+        let (mut c, id) = launched_for_rejects();
+        let mut msg = parse_legacy_message(&dist_bytes(&[(pk(11), 100)], false)).unwrap();
+        let mint_idx = msg.instructions[0].accounts[1] as usize;
+        msg.account_keys[mint_idx] = pk(6);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(serialize_legacy_message(&msg)));
+    }
+
+    #[test]
+    #[should_panic(expected = "transfer amount is not the remaining share")]
+    fn rejects_over_amount() {
+        try_dist(dist_bytes(&[(pk(11), 101)], true));
+    }
+
+    #[test]
+    #[should_panic(expected = "transfer amount is not the remaining share")]
+    fn rejects_under_amount() {
+        try_dist(dist_bytes(&[(pk(11), 99)], true));
+    }
+
+    #[test]
+    #[should_panic(expected = "extra instruction beyond the allowed transfer shape")]
+    fn rejects_extra_instruction() {
+        let (mut c, id) = launched_for_rejects();
+        let mut msg = parse_legacy_message(&dist_bytes(&[(pk(11), 100)], false)).unwrap();
+        msg.account_keys.push(SYSTEM_PROGRAM);
+        msg.header.num_readonly_unsigned += 1;
+        msg.instructions.push(CompiledInstruction {
+            program_id_index: (msg.account_keys.len() - 1) as u8,
+            accounts: vec![0, 1],
+            data: vec![2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+        });
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(serialize_legacy_message(&msg)));
+    }
+
+    #[test]
+    #[should_panic(expected = "transfer source is not the required vault")]
+    fn rejects_wrong_source() {
+        let (mut c, id) = launched_for_rejects();
+        let mut msg = parse_legacy_message(&dist_bytes(&[(pk(11), 100)], false)).unwrap();
+        msg.instructions[0].accounts[0] = 1;
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(serialize_legacy_message(&msg)));
+    }
+
+    #[test]
+    #[should_panic(expected = "ATA payer must be the relayer fee payer")]
+    fn rejects_ata_payer_raise() {
+        let (mut c, id) = launched_for_rejects();
+        let mut msg = parse_legacy_message(&dist_bytes(&[(pk(11), 100)], true)).unwrap();
+        msg.instructions[0].accounts[0] = 1;
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(serialize_legacy_message(&msg)));
+    }
+
+    #[test]
+    #[should_panic(expected = "trailing bytes after legacy message")]
+    fn rejects_trailing_data() {
+        let (mut c, id) = launched_for_rejects();
+        let mut bytes = dist_bytes(&[(pk(11), 100)], true);
+        bytes.push(0);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(bytes));
+    }
+
+    #[test]
+    #[should_panic(expected = "instruction data length is not exact")]
+    fn rejects_trailing_transfer_data() {
+        let (mut c, id) = launched_for_rejects();
+        let mut msg = parse_legacy_message(&dist_bytes(&[(pk(11), 100)], false)).unwrap();
+        msg.instructions[0].data.push(7);
+        testing_env!(context(accounts(3), PAID).build());
+        let _ = c.request_distribute(id, Base64VecU8(serialize_legacy_message(&msg)));
     }
 
     #[test]
@@ -2841,7 +3684,7 @@ mod tests {
         testing_env!(context(accounts(2), PAID).build());
         let _ = c.request_launch(id, Base64VecU8(bytes.clone()));
         testing_env!(context(accounts(2), NearToken::from_yoctonear(1)).build());
-        c.confirm_transfer(message_hash(&bytes), SIG_E.into());
+        c.confirm_launch_outcome(message_hash(&bytes), SIG_E.into(), U64(1_000_000));
         assert_eq!(c.get_trust(id).unwrap().state, TrustState::Launched);
         testing_env!(context(accounts(3), PAID).build());
         let _ = c.register(id, DEMO_PUBKEY.into());

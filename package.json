@@ -17,6 +17,10 @@
     "request-launch": "pnpm --filter @keyless-trust/relayer request-launch",
     "relay-launch": "pnpm --filter @keyless-trust/relayer relay-launch",
     "confirm-launch": "pnpm --filter @keyless-trust/relayer confirm-launch",
+    "build-distribute-message": "pnpm --filter @keyless-trust/relayer build-distribute-message",
+    "request-distribute": "pnpm --filter @keyless-trust/relayer request-distribute",
+    "relay-distribute": "pnpm --filter @keyless-trust/relayer relay-distribute",
+    "confirm-distribute": "pnpm --filter @keyless-trust/relayer confirm-distribute",
     "dev:app": "pnpm --filter @keyless-trust/app dev"
   }
 }

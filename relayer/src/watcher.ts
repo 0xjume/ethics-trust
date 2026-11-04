@@ -7,9 +7,11 @@
  * released hashes (`pending superseded`). An honest late confirm with
  * no re-sign still books.
  *
- * After a sweep / refund / raise-refund signature lands on Solana:
+ * After a sweep / refund / raise-refund / distribute signature lands:
  *   confirm_transfer({ message_hash: sha256(unsigned_message) hex,
  *                      solana_sig })
+ * Launch uses confirm_launch_outcome and also passes tokens_bought
+ * (the raise-ATA balance, 6-decimal raw units).
  */
 export type SweepReport = {
   trustId: string;

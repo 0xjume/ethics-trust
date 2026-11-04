@@ -62,7 +62,7 @@ Milestone 2 (post live test): `create_trust(config)` **requires a watcher** and 
 
 **Watcher trust assumption:** NEAR cannot see Solana. The watcher can delay a raise, under/over-report deposits among real contributors, and delay `confirm_transfer`. It cannot change destinations: every signed transfer source and dest is a stored derived key or the contributor's own pubkey. Anyone can run a second watcher to audit reports against explorers. This is the PLAN §4 trust point, restated after R1.
 
-**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): Milestone 2 was **251 850 bytes** after -Oz. Milestone 3 Shape C (m7 pin) is **299 355 bytes** after -Oz (532 452 before).
+**Toolchain:** rustc stays **1.93.0**. cargo-near wants 1.86 for near-sdk 5.17, but transitive `near-sys 0.2.14` needs 1.93. Size is handled with `wasm-opt -Oz` (`scripts/build-wasm.sh`): Milestone 2 was **251 850 bytes** after -Oz. Milestone 3 Shape C (m7 pin) is **299 355 bytes** after -Oz (532 452 before). Milestone 4 Shape D is **324 604 bytes** after -Oz (573 045 before).
 
 ## Milestone 3 — Shape C DBC launch (3 Nov 2026)
 
@@ -76,8 +76,8 @@ User overrides of PLAN.md (follow the user):
 | First buy = `credited_total − fill_fee` | Fill fee is 1.5% (150 bps) raise → fee vault, in the same tx **or** a prior `request_fill_fee`. `minimum_amount_out ≥ 1`. |
 | `request_launch` attach **≥ 90 TGas** | Two 30 TGas `sign` calls + 20 TGas callback. View `launch_attach_tgas()`. |
 | `dbc_config` is a 32-byte pubkey | Relayer `createConfig2` (SOL-quoted, Ethics curve scaled down) then `create_trust` pins that pubkey. `params_hash` is still sha256(config\\0name\\0symbol\\0uri). |
-| Confirmed launch → `Launched` | `confirm_transfer` records `pool_address` and adds any in-tx fill fee to `fill_fee_paid`. No ledger row. |
-| `request_distribute` panics | Milestone 4 stub. |
+| Confirmed launch → `Launched` | Superseded for the confirm method by Milestone 4: `confirm_launch_outcome` records `pool_address`, `fill_fee_paid`, and `tokens_bought`. |
+| `request_distribute` panics | Milestone 3 stub. Replaced in Milestone 4. |
 
 Borsh layout adds `mint_path`, `mint_address`, `pool_address`, `fill_fee_paid` on `Trust` and `extra` on `PendingTransfer`. `CreateTrustConfig.cap_bps` is a required `u16` (1..=10_000). Deploy a **new** subaccount after this change (**m7** if m6 is already live); do not reuse m5/m6.
 
@@ -102,6 +102,23 @@ Borsh layout adds `mint_path`, `mint_address`, `pool_address`, `fill_fee_paid` o
 | H partial refund signed | Refund / raise-refund must equal the full refundable (or dust close-out). |
 | Launch lock griefing | `request_launch`, `request_fill_fee`, `request_sweep` are watcher-only. Refunds stay permissionless for liveness (contributors have no bound NEAR identity). A stranger can still lock a full refund for 150 s at 0.01 NEAR — documented leftover, not scaled this PR. |
 | Raise still paid init/ATA rent | Init payer and every ATA-create payer must be the tx fee payer (relayer), never raise / mint / fee vault. |
+
+## Milestone 4 — Shape D pro-rata distribution (4 Nov 2026)
+
+User overrides of PLAN §3.5 (follow the user):
+
+| Decision | Why |
+| --- | --- |
+| Share = `floor(tokens_bought × credited / credited_total)` | Credited is the cap the contributor was given. Swept can lag a confirm. Dust (`tokens_bought − Σ floors`) stays in the raise ATA. It is not paid to a last recipient. Dust is strictly less than the number of credited contributors. |
+| `tokens_bought` on `confirm_launch_outcome` only, `U64` JSON string, `1..=1e15` | The contract has no curve params, so it cannot quote the buy. 1e15 is the pinned 1B supply at 6 decimals. Under-report scales every share down (residual stays in the raise ATA). Over-report up to the cap can make transfers fail on Solana if the ATA is short. The watcher cannot change destinations. `confirm_transfer` stays two arguments: near-sdk 5.17 does not serde-default a missing `Option`, and a third field would break sweep / refund JSON. |
+| Classic Tokenkeg only | Shape C uses `initialize_virtual_pool_with_spl_token` and rejects Token-2022. Distribution pins TransferChecked decimals 6 and ATA seeds `[owner, Tokenkeg, mint]`. The program id is a constant, not a `Trust` field. |
+| Books on confirm, not on sign | Same pending ledger as sweeps: sha256 message, per-contributor lock and nonce, 150 s, `release_pending`, `seen_sigs`, `consumed_hashes`. A re-sign supersedes the released row so release + re-sign cannot double-pay. An honest late confirm with no re-sign still books. |
+| Permissionless claim, per-contributor lock | One stranger paying 0.01 NEAR can freeze only the contributors in that message. A batch locks every included leg (at most 5) for 150 s. Contributors left out stay claimable. Launch and sweep stay watcher-only. |
+| Deposit 0.01 NEAR, attach ≥ 60 TGas | Same `sign_deposit` as other signs; excess refunded. 60 = 30 TGas `sign` + 20 TGas callback + checker headroom. View `distribute_attach_tgas()`. |
+| `Distributed` when `distributed_total >= claimable_total` | `claimable_total` is the sum of floors, not `tokens_bought`. Zero claimable at launch confirm goes straight to `Distributed`. Register is rejected there. `report_deposit` is rejected in Launched and Distributed. |
+| Destination = register pubkey | The same owner refunds pay. CreateIdempotent payer is the relayer fee payer, never raise / mint / fee. No extra instructions. |
+
+Borsh adds `tokens_bought`, `claimable_total`, `distributed_total` on `Trust` and `distributed_tokens` on `Contribution`. `PendingTransfer` is unchanged; distribute reuses `extra` as comma-separated `owner_b58:amount:nonce`. No new collection prefixes. Deploy a **new** subaccount (**m9**). Do not reuse m5, m6, or m7.
 
 ## MPC `sign` gas and Solana fee payer (3 Nov 2026)
 

@@ -228,12 +228,68 @@ RAISE_SIGNATURE=... MINT_SIGNATURE=... \
 RAISE_ADDRESS=... MINT_ADDRESS=... \
 SOLANA_SUBMIT=1 pnpm relay-launch
 
-# 8. Watcher confirms → Launched; pool_address and fill_fee_paid recorded.
+# 8. Watcher confirms the launch and the raise-ATA token balance
+#    (6-decimal raw units, decimal string). → Launched.
 EXECUTE_CONFIRM_LAUNCH=1 LAUNCH_MESSAGE_HASH=... SOLANA_SIG=... \
+  TOKENS_BOUGHT=<raw units> \
   pnpm confirm-launch
 ```
 
-`request_distribute` is Milestone 4 and panics.
+Pro-rata claims are the m9 recipe below. Do not call `request_distribute` on m7.
+
+### Milestone 4 deploy recipe (m9)
+
+Borsh adds `tokens_bought`, `claimable_total`, and `distributed_total` on
+`Trust`, and `distributed_tokens` on `Contribution`. Deploy a **new**
+subaccount. Do not reuse m5, m6, or m7. This agent does not deploy or spend.
+Human-run on NEAR **testnet** and Solana **devnet** only.
+
+```bash
+scripts/build-wasm.sh
+NEAR_ACCOUNT_ID=keyless-trust-dev-54ef71.testnet \
+NEAR_PRIVATE_KEY=ed25519:... \
+DEPLOY_SUBACCOUNT=m9 \
+EXECUTE_DEPLOY=1 \
+pnpm deploy-testnet
+# → m9.keyless-trust-dev-54ef71.testnet  (waitUntil FINAL, no full-access key)
+
+export CONTRACT_ID=m9.keyless-trust-dev-54ef71.testnet
+export NEAR_PREDECESSOR=$CONTRACT_ID
+export TRUST_ID=1
+
+# 1–7. Same raise as the m7 recipe: derive, createConfig2, create_trust,
+#      register, sweep, build-launch-message, request-launch (90 TGas),
+#      relay-launch. Relayer still pays init + ATA rent.
+
+# 8. Watcher reads the raise token ATA (classic Tokenkeg, mint = trust/<id>/mint,
+#    6 decimals) and confirms. tokens_bought is a decimal string (U64).
+EXECUTE_CONFIRM_LAUNCH=1 LAUNCH_MESSAGE_HASH=... SOLANA_SIG=... \
+  TOKENS_BOUGHT=<raw units> \
+  pnpm confirm-launch
+# state = Launched, unless every floor share is 0 (then Distributed).
+
+# 9. Build one claim or a batch of up to 5. Amount is the remaining floor
+#    share. Omit AMOUNT to compute floor(TOKENS_BOUGHT * CREDITED / TOTAL).
+#    CREATE_ATA=0 skips CreateIdempotent when the destination ATA exists.
+CONTRIBUTOR_OWNER=<register pubkey> \
+TOKENS_BOUGHT=<raw> CREDITED_TOTAL=<credited_total> CONTRIBUTOR_CREDITED=<credited> \
+  pnpm build-distribute-message
+# or DISTRIBUTE_CLAIMS='[{"owner":"<b58>","amount":"<raw>","createAta":true}]'
+
+# 10. Permissionless. Attach 60 TGas + 0.01 NEAR. One raise MPC sign.
+#     Locks only the contributors in the message for 150 s.
+EXECUTE_REQUEST_DISTRIBUTE=1 DISTRIBUTE_MESSAGE_B64=... pnpm request-distribute
+
+# 11. Relayer co-signs (2 signatures: relayer + raise) and submits.
+RAISE_SIGNATURE=... RAISE_ADDRESS=... \
+SOLANA_SUBMIT=1 DISTRIBUTE_MESSAGE_B64=... \
+  pnpm relay-distribute
+
+# 12. Watcher confirm_transfer books the shares. Distributed when
+#     distributed_total >= claimable_total. Dust stays in the raise ATA.
+EXECUTE_CONFIRM_DISTRIBUTE=1 DISTRIBUTE_MESSAGE_HASH=... SOLANA_SIG=... \
+  pnpm confirm-distribute
+```
 
 ### Deploy script
 
