@@ -374,7 +374,7 @@ Ethics (https://ethics.ltd) is the existing product. This repository reuses patt
 
 Related project by the same lead: Sana Guard, https://github.com/0xjume/sana-guard. It is independent and shares no code.
 
-Code in this repository was written with AI assistance. The libraries below are public packages. Pre-hackathon work in this repo is the day-1 research in `docs/PLAN.md` and `docs/spikes.md`. The contract, relayer, and web app were written in the hackathon window.
+Code in this repository was written with AI assistance. The libraries below are public packages. All code and docs in this repository were written during the hackathon window, starting 3 Nov 2026. There is no pre-hackathon baseline.
 
 Libraries:
 
