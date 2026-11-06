@@ -106,6 +106,77 @@ export function finalizeLaunchMessage(
   return Buffer.from(message);
 }
 
+/**
+ * Shape C message for a trust whose vaults are already stored.
+ * `fillFeeLamports` is 0 when the fee was paid with `request_fill_fee`.
+ * `minimum_amount_out` is the SDK quote of `demoCurveConfig`. Callers must
+ * only use this when the trust curve matches that demo curve.
+ */
+export async function buildLaunchMessageForTrust(args: {
+  connection: Connection;
+  relayer: PublicKey;
+  raise: PublicKey;
+  feeVault: PublicKey;
+  mint: PublicKey;
+  config: PublicKey;
+  name: string;
+  symbol: string;
+  uri: string;
+  buyLamports: bigint;
+  fillFeeLamports: bigint;
+  blockhash?: string;
+}): Promise<{
+  message: Buffer;
+  messageHash: string;
+  messageBase64: string;
+  minOut: string;
+  blockhash: string;
+}> {
+  if (args.buyLamports <= 0n) throw new Error("first-buy amount must be > 0");
+  if (args.fillFeeLamports < 0n) throw new Error("fill fee must be >= 0");
+  if (args.fillFeeLamports > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("fill fee does not fit the launch builder");
+  }
+  const client = new DynamicBondingCurveClient(args.connection, "confirmed");
+  const curve = demoCurveConfig();
+  const minOut = quoteFirstBuyOutput(curve, new BN(args.buyLamports.toString()));
+  const blockhash =
+    args.blockhash ?? (await args.connection.getLatestBlockhash("confirmed")).blockhash;
+  const poolTx = await client.creator.createPoolWithFirstBuy({
+    createPoolParam: {
+      baseMint: args.mint,
+      config: args.config,
+      name: args.name,
+      symbol: args.symbol,
+      uri: args.uri,
+      payer: args.relayer,
+      poolCreator: args.raise,
+    },
+    firstBuyParam: {
+      buyer: args.raise,
+      buyAmount: new BN(args.buyLamports.toString()),
+      minimumAmountOut: minOut,
+      referralTokenAccount: null,
+    },
+  });
+  const fee = args.fillFeeLamports === 0n ? 0 : Number(args.fillFeeLamports);
+  const message = finalizeLaunchMessage(
+    poolTx,
+    args.raise,
+    args.feeVault,
+    args.relayer,
+    fee,
+    blockhash,
+  );
+  return {
+    message,
+    messageHash: createHash("sha256").update(message).digest("hex"),
+    messageBase64: Buffer.from(message).toString("base64"),
+    minOut: minOut.toString(10),
+    blockhash,
+  };
+}
+
 /** Same SDK path as createPoolWithFirstBuy, but builds config+pool locally (no live config). */
 export async function buildSdkLaunchTransaction(args: {
   connection: Connection;
@@ -183,37 +254,20 @@ export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
     rows.find((r) => r.path.endsWith("/mint"))!.solana_address,
   );
   const relayer = loadRelayerKeypair();
-
   const connection = new Connection(RPC, "confirmed");
-  const client = new DynamicBondingCurveClient(connection, "confirmed");
-  const curve = demoCurveConfig();
-  const minOut = quoteFirstBuyOutput(curve, new BN(buy.toString()));
-  const { blockhash } = await connection.getLatestBlockhash("confirmed");
-  let poolTx = await client.creator.createPoolWithFirstBuy({
-    createPoolParam: {
-      baseMint: mint,
-      config: new PublicKey(config),
-      name,
-      symbol,
-      uri,
-      payer: relayer.publicKey,
-      poolCreator: raise,
-    },
-    firstBuyParam: {
-      buyer: raise,
-      buyAmount: new BN(buy.toString()),
-      minimumAmountOut: minOut,
-      referralTokenAccount: null,
-    },
-  });
-  const message = finalizeLaunchMessage(
-    poolTx,
+  const built = await buildLaunchMessageForTrust({
+    connection,
+    relayer: relayer.publicKey,
     raise,
-    fees,
-    relayer.publicKey,
-    alreadyPaid ? 0 : Number(fee),
-    blockhash,
-  );
+    feeVault: fees,
+    mint,
+    config: new PublicKey(config),
+    name,
+    symbol,
+    uri,
+    buyLamports: buy,
+    fillFeeLamports: alreadyPaid ? 0n : fee,
+  });
 
   return {
     trustId,
@@ -225,17 +279,23 @@ export async function buildLaunchMessage(): Promise<Record<string, unknown>> {
     name,
     symbol,
     uri,
-    paramsHash: await pinParamsHash(config, name, symbol, uri, storedCurveFromConfig(curve)),
+    paramsHash: await pinParamsHash(
+      config,
+      name,
+      symbol,
+      uri,
+      storedCurveFromConfig(demoCurveConfig()),
+    ),
     creditedLamports: credited.toString(),
     fillFeeLamports: alreadyPaid ? "0" : fee.toString(),
     buyLamports: buy.toString(),
-    minOut: minOut.toString(10),
-    messageBytes: message.length,
+    minOut: built.minOut,
+    messageBytes: built.message.length,
     packetLimit: PACKET_LIMIT,
-    messageBase64: Buffer.from(message).toString("base64"),
-    messageHash: createHash("sha256").update(message).digest("hex"),
+    messageBase64: built.messageBase64,
+    messageHash: built.messageHash,
     relayerFeePayer: relayer.publicKey.toBase58(),
-    recentBlockhash: blockhash,
+    recentBlockhash: built.blockhash,
   };
 }
 

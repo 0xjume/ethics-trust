@@ -23,6 +23,7 @@
     "request-distribute": "pnpm --filter @keyless-trust/relayer request-distribute",
     "relay-distribute": "pnpm --filter @keyless-trust/relayer relay-distribute",
     "confirm-distribute": "pnpm --filter @keyless-trust/relayer confirm-distribute",
+    "relayer": "pnpm --filter @keyless-trust/relayer start",
     "dev:app": "pnpm --filter @keyless-trust/app dev"
   },
   "pnpm": {

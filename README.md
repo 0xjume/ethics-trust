@@ -185,7 +185,7 @@ This repository is a NEAR testnet and Solana devnet demo. It is not an offering,
 | Path | What it is |
 | --- | --- |
 | `contracts/keyless-trust/` | NEAR contract. near-sdk 5.17.0. Parser, shape checkers, quote, MPC promises. |
-| `relayer/` | TypeScript builders and one-shot scripts. Watcher stub. near-api-js and `@solana/web3.js`. |
+| `relayer/` | TypeScript builders, one-shot scripts, and the long-running watcher/relayer. near-api-js and `@solana/web3.js`. |
 | `app/` | Next.js web app. Trust list, create, contribute, actions, and Verify. Reads public testnet and devnet RPC. |
 | `packages/ui/` | Design tokens, amount formatting, and `create_trust` validation shared with the app. |
 | `scripts/` | `build-wasm.sh`, `deploy-testnet.sh`, and thin wrappers. The implementations live in `relayer/src`. |
@@ -302,10 +302,11 @@ Root `package.json` scripts. Read-only or dry-run unless the gate in the last co
 | `pnpm relay-distribute` | Relayer co-signs and can submit | `SOLANA_SUBMIT=1` |
 | `pnpm confirm-distribute` | Watcher `confirm_transfer` | `EXECUTE_CONFIRM_DISTRIBUTE=1` |
 | `pnpm deploy-testnet` | Deploy the wasm to a testnet subaccount | `EXECUTE_DEPLOY=1` |
+| `pnpm relayer` | Long-running watcher and relayer. Polls, logs, and (when enabled) reports, sweeps, launches, distributes, and refunds | `SOLANA_SUBMIT=1` |
 
 `pnpm --filter @keyless-trust/relayer near-signed-transfer` is the day-1 SOL transfer. It refuses to run unless `EXECUTE_NEAR_SIGNED_TRANSFER=1`, and it submits only when `SOLANA_SUBMIT=1`.
 
-`relayer/src/watcher.ts` exports `watchDeposits`, which returns an empty list. There is no long-running watcher process in this repository.
+`pnpm relayer` (or `pnpm --filter @keyless-trust/relayer start`) runs the loop in `relayer/src/main.ts`. `watchDeposits` reads Solana balances and decides when `report_deposit` is due. Without `NEAR_WATCHER_ACCOUNT_ID`, a watcher key, and `SOLANA_RELAYER_KEYPAIR`, the process exits. With those set and `SOLANA_SUBMIT` unset, it polls and logs the planned action and sends nothing. Env, dry-run, and the contract views the loop scans are in `relayer/README.md`.
 
 ## Try it
 
@@ -371,7 +372,7 @@ Done: milestones 1 to 4 and the web app.
 
 Next:
 
-- A watcher and relayer service. The repo has one-shot scripts and a watcher stub that returns no deposits.
+- A hosted watcher. The process is `pnpm relayer` (`relayer/src/main.ts`). It polls testnet and devnet, reads deposit balances, and drives report, sweep, launch, distribute, refund, and pending release. `SOLANA_SUBMIT=1` sends. Unset is dry-run. Railway hosting is not wired up yet.
 - The 70/20/10 fee split (70% holders distributor, 20% Ethics holders distributor, 10% platform), with destinations fixed at `create_trust`.
 - Moving the web app to `@solana/kit`.
 - Agent access, not live yet: a Model Context Protocol (MCP) server with `list_trusts`, `get_trust`, `join_trust`, `request_refund`, and claim, plus `llms.txt`, so AI agents can join a Trust with their own NEAR and Solana keys. The server never holds keys. Neither the MCP server nor `llms.txt` is deployed.
