@@ -4,6 +4,8 @@ NEAR Hackathon 2026, track `memecoins` ("Memecoins With Mechanics"). NEAR testne
 
 **Live demo: https://trust.ethics.ltd (testnet/devnet)**
 
+**Demo post:** https://x.com/ethicslaunch/status/2120472863178461406 (@ethicslaunch). This is the public demo post for the submission. The hosted product demo is https://trust.ethics.ltd.
+
 The production site is HTTPS on Vercel, on the custom domain above. It reads NEAR testnet and Solana devnet. Fallback: https://keyless-trust.vercel.app.
 
 ## Summary
@@ -312,6 +314,8 @@ Root `package.json` scripts. Read-only or dry-run unless the gate in the last co
 
 Start at the live app. It reads the deployed testnet contract. No funded account is required to read it. If https://trust.ethics.ltd does not load, use https://keyless-trust.vercel.app. The same paths work on both hosts.
 
+The public demo post is https://x.com/ethicslaunch/status/2120472863178461406, from @ethicslaunch. The steps below open the hosted app.
+
 1. **Do** open https://trust.ethics.ltd. **See** the home page. The footer reads NEAR Hackathon 2026, track `memecoins`, testnet and devnet only.
 2. **Do** open https://trust.ethics.ltd/trusts. **See** the rows returned by `list_trusts` on `m10.keyless-trust-dev-54ef71.testnet`. No wallet. The page states that "raised" SOL is what the watcher has credited.
 3. **Do** open a trust id from that list, or open https://trust.ethics.ltd/verify if the list is empty. **See** on Verify: `view_access_key_list` for the contract, MPC signer `v1.signer-prod.testnet`, domain id 1 (Ed25519), paths `trust/1/raise`, `trust/1/fees`, and `trust/1/mint`, plus the two transactions below.
@@ -358,6 +362,7 @@ Earlier subaccounts with live runs in `docs/spikes.md`: `m2`, `m3`, `m4`, and `m
 ## Project links
 
 - Live demo: [https://trust.ethics.ltd](https://trust.ethics.ltd) (testnet/devnet). Hosted on Vercel, HTTPS. Fallback: [https://keyless-trust.vercel.app](https://keyless-trust.vercel.app).
+- Demo post: [https://x.com/ethicslaunch/status/2120472863178461406](https://x.com/ethicslaunch/status/2120472863178461406) (X, @ethicslaunch). Public demo post for the submission.
 - Ethics, the existing product: [https://ethics.ltd](https://ethics.ltd).
 
 ## Status and roadmap
